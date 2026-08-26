@@ -62,8 +62,9 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
             if (search_holdoff_counter > 0) {
                 search_holdoff_counter--;
 
-                // Обязательно обновляем кольцевой буфер, чтобы вытеснить старый сигнал
-                sync_buffer[sync_buf_idx] = x_curr;
+                /* заануляем старый сигнал */
+                sync_buffer[sync_buf_idx].re = 0.0f;
+                sync_buffer[sync_buf_idx].im = 0.0f;
                 sync_buf_idx = (sync_buf_idx + 1) % N_SAMPLES;
                 break;
             }
@@ -87,6 +88,8 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
 
             if (R_energy > 0.01f) {
                 float metric = (P.re * P.re + P.im * P.im) / (R_energy * R_energy);
+
+                if (metric > 1.0f) metric = 1.0f;
 
                 if (metric > 0.80f) {
                     float phase_diff = atan2f(P.im, P.re);
@@ -121,6 +124,13 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
                     rx_init();
                     break;
                 }
+            }
+
+            // В режиме ожидания принудительно зачищаем data_buffer нулями,
+            // полностью уничтожая следы старых символов и преамбулы!
+            if (guard_sample_cnt < N_SAMPLES) {
+                data_buffer[guard_sample_cnt - 1].re = 0.0f;
+                data_buffer[guard_sample_cnt - 1].im = 0.0f;
             }
 
             if (guard_sample_cnt >= samples_to_wait) {
@@ -239,19 +249,24 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
                 // Проверка флага завершения передачи по маркеру EOT
                 if (rx_phases_initialized && decoded_nibble == 0x0F) {
                     printf("[FSM Завершение] Получен маркер EOT. Поток остановлен.\n");
+                    // ТОТАЛЬНАЯ КЛИНЕНС-ЗАЧИСТКА ВСЕЙ ПАМЯТИ ЦОС:
+                    // Полностью обнуляем аккумуляторы, сбрасывая накопленную float-погрешность
+                    P.re = 0.0f; P.im = 0.0f;
+                    R_energy = 0.0f;
+                    sync_buf_idx = 0;
+                    for (int i = 0; i < N_SAMPLES; i++) {
+                        sync_buffer[i].re = 0.0f;
+                        sync_buffer[i].im = 0.0f;
+                        data_buffer[i].re = 0.0f;
+                        data_buffer[i].im = 0.0f;
+                    }
+
                     rx_current_state = RX_STATE_SEARCH;
                     rx_phases_initialized = false;
-
-                    search_holdoff_counter = 1200;
+                    search_holdoff_counter = 1600; // 200 мс жесткой слепоты для полного затухания эфира
                     return true;
                 }
-
-                // Шагаем на следующий символ потока через пропуск CP
-                guard_sample_cnt = 0;
-                rx_current_state = RX_STATE_GUARD;
-                return rx_phases_initialized; // Возвращаем true только для боевых букв
-                }
-            break;
+            } break;
         }
     }
     return false;
