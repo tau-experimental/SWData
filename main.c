@@ -37,7 +37,8 @@ void write_sample_with_jitter(int16_t *iq_frame, FILE *file, uint32_t *samples_w
 
 // Эмулятор КВ канала: добавляет сдвиг частоты и шум
 void apply_kv_channel_iq(complex_f *input, float freq_shift_hz, uint32_t sample_idx, int16_t *out_i, int16_t *out_q) {
-    float t = (float)sample_idx / FS;
+#if 0
+	float t = (float)sample_idx / FS;
     float phase = 2.0f * PI_F * freq_shift_hz * t;
 
     // Комплексный поворот фазы
@@ -50,6 +51,11 @@ void apply_kv_channel_iq(complex_f *input, float freq_shift_hz, uint32_t sample_
 
     *out_i = (int16_t)(i_rot * 16384.0f);
     *out_q = (int16_t)(q_rot * 16384.0f);
+#else
+    *out_i = (int16_t)(input->re * 16384.0f);
+    *out_q = (int16_t)(input->im * 16384.0f);
+#endif
+
 }
 
 // Функция передачи одного полного OFDM-кадра (CP + Данные)
@@ -72,8 +78,8 @@ int main(void) {
     FILE *wav_file_out = wav_open_write("transmission.wav", FS);
     if (!wav_file_out) return -1;
 
-    float simulated_frequency_drift = ((float)(rand() % 60) - 30.0f);
-    uint32_t random_silence_samples = 200 + (rand() % 800);
+    float simulated_frequency_drift = 0;//((float)(rand() % 60) - 30.0f);
+    uint32_t random_silence_samples = 0;//200 + (rand() % 800);
     uint32_t global_tx_counter = 0;
     uint32_t real_file_samples = 0;
     int16_t iq_frame[2];

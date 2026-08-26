@@ -206,9 +206,9 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
                 }
 
                 data_sample_cnt = 0;
-
                 // РАБОТА ПЕТЛИ DPLL И ВЫБОР ШАГА СЛЕДУЮЩЕГО КАДРА
                 if (rx_phases_initialized) {
+#if 0
 
                 	// Увеличиваем скорость накопления ошибки фазы тактирования (Loop Gain = 0.08)
                 	dpll_error_accumulator += total_timing_phase_error * 0.08f;
@@ -234,7 +234,12 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
                         current_target_data_samples = N_SAMPLES;
                         samples_to_wait = CP_SAMPLES;
                     }
-
+#else
+                    // ВРЕМЕННО ОТКЛЮЧАЕМ АВТОМАТИКУ DPLL ДЛЯ ЛАБОРАТОРНОГО ТЕСТА
+                    current_target_data_samples = N_SAMPLES; // Строго 160
+                    samples_to_wait = CP_SAMPLES;             // Строго 32
+                    dpll_error_accumulator = 0.0f;
+#endif
                 } else {
                     // Обработали первый ("гарпунный") символ
                     printf("[DPSK Базис] 'Гарпунный' символ успешно захвачен и сохранен как фазовая опора кадра.\n");
