@@ -1,144 +1,99 @@
-#include "rx.h"
 #include "config.h"
-#include <stdio.h>
 #include <math.h>
+#include <stdio.h>
+#include <stdbool.h>
+#include <inttypes.h>
 
-static complex_f data_buffer[TOTAL_SYMBOL_SAMPLES];
-static uint32_t rx_global_timer = 0;
-static uint32_t sync_absolute_tick = 0;
+#include "rx.h"
 
-static rx_state_t rx_current_state = RX_STATE_SEARCH;
-static float freq_offset_hz = 0.0f;
-static complex_f prev_tone_integrals[NUM_DATA_TONES];
-static float preamble_freq_stats[PREAMBLE_SYMBOLS];
-static uint32_t preamble_symbol_cnt = 0;
+// Линейка из 4 независимых каналов
+channel_filter_t rx_channels[NUM_DATA_TONES];
 
-static uint32_t last_click_tick = 0;
-
-void rx_init(void) {
-    rx_current_state = RX_STATE_SEARCH;
-    rx_global_timer = 0;
-    sync_absolute_tick = 0;
-    freq_offset_hz = 0.0f;
-    preamble_symbol_cnt = 0;
-    for(int i=0; i<TOTAL_SYMBOL_SAMPLES; i++) { data_buffer[i].re = 0.0f; data_buffer[i].im = 0.0f; }
-    for(int i=0; i<NUM_DATA_TONES; i++) { prev_tone_integrals[i].re = 0.0f; prev_tone_integrals[i].im = 0.0f; }
-    printf("[Приемник] Режим SEARCH: Интегральный N-сэмпловый дискриминатор скачков запущен.\n");
-}
-
-void calc_sliding_dft(complex_f *buf_ptr, int w_len, int timer_base, complex_f *results) {
-    for (int tone = 0; tone < NUM_DATA_TONES; tone++) {
-        float tone_freq = data_tones[tone]; // ПРИЁМНИК ВСЕГДА ИЩЕТ НА ИДЕАЛЬНЫХ ЧАСТОТАХ (1000, 1200...)
-        results[tone].re = 0.0f;
-        results[tone].im = 0.0f;
-
-        for (int i = 0; i < w_len; i++) {
-            // Вычисляем абсолютный индекс времени для текущего сэмпла
-            uint32_t absolute_sample_tick = timer_base + i;
-
-            // Вместо деления огромного времени на FS, считаем набег фазы на один сэмпл:
-            float phase_per_sample = 2.0f * PI_F * tone_freq / FS;
-
-            // Полный угол равен phase_per_sample * absolute_sample_tick.
-            // Сворачиваем его по модулю 2*PI, используя fmodf, чтобы защитить точность float!
-            float angle = fmodf((float)absolute_sample_tick * phase_per_sample, 2.0f * PI_F);
-
-            float cos_ref = cosf(angle);
-            float sin_ref = sinf(angle);
-
-            // Квалифицированное комплексное ДПФ-проектирование
-            results[tone].re += buf_ptr[i].re * cos_ref + buf_ptr[i].im * sin_ref;
-            results[tone].im += buf_ptr[i].im * cos_ref - buf_ptr[i].re * sin_ref;
-        }
-    }
-}
-
-// Восстановленная точная глобальная ДПФ для этапа калибровки
-void execute_global_dft(complex_f *buffer, uint32_t start_time, complex_f *results) {
-    for (int tone = 0; tone < NUM_DATA_TONES; tone++) {
-        float tone_freq = data_tones[tone];
-        results[tone].re = 0.0f; results[tone].im = 0.0f;
-        for (int i = 0; i < N_SAMPLES; i++) {
-            uint32_t current_tick = start_time + i;
-            float t_global = (float)current_tick / FS;
-            float cos_ref = cosf(2.0f * PI_F * tone_freq * t_global);
-            float sin_ref = sinf(2.0f * PI_F * tone_freq * t_global);
-            results[tone].re += buffer[i].re * cos_ref + buffer[i].im * sin_ref;
-            results[tone].im += buffer[i].im * cos_ref - buffer[i].re * sin_ref;
-        }
-    }
-}
-
-void rx_process_sample(complex_f *sample, uint8_t *result_nibble) {
-    uint32_t current_tick = rx_global_timer;
-    rx_global_timer++;
-
-    int head = current_tick % TOTAL_SYMBOL_SAMPLES;
-    data_buffer[head] = *sample;
-
-    if (current_tick < (SEARCH_WIN_LEN * 2)) return;
-
-    complex_f local_win_A[SEARCH_WIN_LEN];
-    complex_f local_win_B[SEARCH_WIN_LEN];
-
-    for (int i = 0; i < SEARCH_WIN_LEN; i++) {
-        int idx_A = (head - SEARCH_WIN_LEN + i + TOTAL_SYMBOL_SAMPLES) % TOTAL_SYMBOL_SAMPLES;
-        int idx_B = (head - (SEARCH_WIN_LEN * 2) + i + TOTAL_SYMBOL_SAMPLES) % TOTAL_SYMBOL_SAMPLES;
-        local_win_A[i] = data_buffer[idx_A];
-        local_win_B[i] = data_buffer[idx_B];
-    }
-
-    uint32_t time_A_start = current_tick - SEARCH_WIN_LEN;
-    uint32_t time_B_start = current_tick - (SEARCH_WIN_LEN * 2);
-
-    complex_f dft_win_A[NUM_DATA_TONES];
-    complex_f dft_win_B[NUM_DATA_TONES];
-
-    calc_sliding_dft(local_win_A, SEARCH_WIN_LEN, time_A_start, dft_win_A);
-    calc_sliding_dft(local_win_B, SEARCH_WIN_LEN, time_B_start, dft_win_B);
-
-    float signal_detection_index = 0.0f;
-    float tone_jumps[NUM_DATA_TONES] = {0};
-
+// Инициализация банка фильтров
+void rx_filters_init(void) {
     for (int t = 0; t < NUM_DATA_TONES; t++) {
-        float phi_A = atan2f(dft_win_A[t].im, dft_win_A[t].re);
-        float phi_B = atan2f(dft_win_B[t].im, dft_win_B[t].re);
+        float tone_freq = data_tones[t];
+        rx_channels[t].freq_target = tone_freq;
 
-        float d_phi = phi_A - phi_B;
-        if (d_phi > PI_F)  d_phi -= 2.0f * PI_F;
-        if (d_phi < -PI_F) d_phi += 2.0f * PI_F;
+        // Шаг фазы опорной частоты на один сэмпл
+        float w0 = 2.0f * PI_F * tone_freq / FS;
+        rx_channels[t].cos_w0 = cosf(w0);
+        rx_channels[t].sin_w0 = sinf(w0);
 
-        static float reference_d_phi;
-        if (t == 0) {
-            reference_d_phi = d_phi;
-            tone_jumps[t] = d_phi;
-        } else {
-            float true_jump = d_phi - reference_d_phi;
-            if (true_jump > PI_F)  true_jump -= 2.0f * PI_F;
-            if (true_jump < -PI_F) true_jump += 2.0f * PI_F;
+        // Сброс состояний
+        rx_channels[t].y_prev.re = 0.0f;
+        rx_channels[t].y_prev.im = 0.0f;
+        rx_channels[t].y_delayed.re = 0.0f;
+        rx_channels[t].y_delayed.im = 0.0f;
 
-            tone_jumps[t] = true_jump;
-            signal_detection_index += fabsf(true_jump);
-        }
+        rx_channels[t].cfo_error_hz = 0.0f;
+        rx_channels[t].phase_jump_metric = 0.0f;
+        rx_channels[t].hold_counter = 0;
+        rx_channels[t].is_switching = false;
     }
-
-    static uint32_t last_click_tick = 0;
-
-    // Уменьшаем Hold-защиту до 32 сэмплов, чтобы увидеть МАКСИМУМ структуры сигнала
-    if (signal_detection_index > 2.0f && (current_tick - last_click_tick) > 32) {
-        uint32_t exact_click_sample = current_tick - SEARCH_WIN_LEN;
-        uint32_t delta_from_last = exact_click_sample - last_click_tick;
-
-        printf("[ОСЦИЛЛОГРАФ] Сэмпл: #%u | Шаг: %u | Метрика: %.2f | Сдвиги фаз тонов: [1000]=%.2f, [1200]=%.2f, [1400]=%.2f, [1600]=%.2f\n",
-               exact_click_sample,
-               (last_click_tick == 0) ? 0 : delta_from_last,
-               signal_detection_index,
-               tone_jumps[0] * 180.0f / PI_F,  // Переводим в градусы для наглядности
-               tone_jumps[1] * 180.0f / PI_F,
-               tone_jumps[2] * 180.0f / PI_F,
-               tone_jumps[3] * 180.0f / PI_F);
-
-        last_click_tick = exact_click_sample;
-    }
+    printf("[RX_ENGINE] Высокодобротный банк фильтров (50 Гц) инициализирован.\n");
 }
 
+// Потоковая обработка одного комплексного сэмпла
+// На входе: сырой сэмпл из эфира (или после гетеродина)
+void rx_filters_process_sample(const complex_f *in_sample) {
+    for (int t = 0; t < NUM_DATA_TONES; t++) {
+        channel_filter_t *ch = &rx_channels[t];
+
+        // 1. Комплексное гетеродинирование встроенного опорного сигнала "на лету"
+        // Считаем X[n] * e^{-j * w0}
+        float x_mixed_re = in_sample->re * ch->cos_w0 + in_sample->im * ch->sin_w0;
+        float x_mixed_im = in_sample->im * ch->cos_w0 - in_sample->re * ch->sin_w0;
+
+        // 2. Рекурсивное обновление скользящего Гёрцеля: Y[n] = ALPHA * Y[n-1] + Mixed
+        complex_f y_curr;
+        y_curr.re = ALPHA_POLE * ch->y_prev.re + x_mixed_re;
+        y_curr.im = ALPHA_POLE * ch->y_prev.im + x_mixed_im;
+
+        // 3. Вычисление автокорреляции: D[n] = Y[n] * Y*[n-1]
+        complex_f d;
+        d.re = y_curr.re * ch->y_prev.re + y_curr.im * ch->y_prev.im;
+        d.im = y_curr.im * ch->y_prev.re - y_curr.re * ch->y_prev.im;
+
+        // Проверяем наличие энергии в канале, чтобы избежать деления на ноль в тишине
+        float magnitude_sq = y_curr.re * y_curr.re + y_curr.im * y_curr.im;
+        if (magnitude_sq > 1e-5f) {
+            // 4. Извлекаем угол разности фаз
+            float delta_theta = atan2f(d.im, d.re);
+
+            // Расчет CFO в Гц: отклонение частоты от опорной
+            ch->cfo_error_hz = delta_theta * (FS / (2.0f * PI_F));
+
+            // 5. Фазовый детектор: оценка стабильности частоты/фазы
+            // Если идет стабильный тон (пусть и со сдвигом частоты), delta_theta константен.
+            // Но в момент скачка фазы на границе символа, delta_theta резко срывается.
+            // Метрика скачка: разница между текущим углом и предыдущим сохраненным трендом
+            static float last_theta[NUM_DATA_TONES];
+            float theta_diff = fabsf(delta_theta - last_theta[t]);
+            if (theta_diff > PI_F) theta_diff = 2.0f * PI_F - theta_diff;
+
+            ch->phase_jump_metric = theta_diff;
+            last_theta[t] = delta_theta;
+
+            // Пороговый детектор скачка фазы (экспериментальный порог, подлежит калибровке)
+            if (ch->phase_jump_metric > 0.5f) {
+                ch->is_switching = true;
+                ch->hold_counter = HOLD_TIME_SAMPLES; // Взводим Hold-таймер удержания
+            }
+        } else {
+            ch->cfo_error_hz = 0.0f;
+            ch->phase_jump_metric = 0.0f;
+        }
+
+        // Логика работы оконного hold-таймера
+        if (ch->hold_counter > 0) {
+            ch->hold_counter--;
+            if (ch->hold_counter == 0) {
+                ch->is_switching = false; // Окно закрылось, сбрасываем подозрение
+            }
+        }
+
+        // Сохраняем состояние для следующего сэмпла
+        ch->y_prev = y_curr;
+    }
+}
