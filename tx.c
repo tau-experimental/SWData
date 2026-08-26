@@ -20,12 +20,14 @@ void tx_init(void) {
     uint32_t tx_sample_counter = 0;
 }
 
+#define DRIFT	-(0*536870) // 10Hz
+
 // Шаги приращения фазы для 32-битного DDS при FS=8000 Гц
 static const uint32_t dds_increments[NUM_DATA_TONES] = {
-    536870912UL, // 1000 Гц
-    644245094UL, // 1200 Гц
-    751619276UL, // 1400 Гц
-    858993459UL  // 1600 Гц
+		DRIFT + 536870912UL, // 1000 Гц
+		DRIFT + 644245094UL, // 1200 Гц
+		DRIFT + 751619276UL, // 1400 Гц
+		DRIFT + 858993459UL  // 1600 Гц
 };
 
 void tx_step_phase(uint8_t nibble) {

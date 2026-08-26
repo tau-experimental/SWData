@@ -2,10 +2,10 @@
 #define CONFIG_H
 
 #define FS 8000
-#define N_SAMPLES 160
+#define N_SAMPLES 1280
 #define HALF_N (N_SAMPLES / 2)
 // ЦИКЛИЧЕСКИЙ ПРЕФИКС (ЗАЩИТНЫЙ ИНТЕРВАЛ)
-#define CP_SAMPLES 32         // 4 мс защиты от ионосферного эха
+#define CP_SAMPLES 256         // 4 мс защиты от ионосферного эха
 #define TOTAL_SYMBOL_SAMPLES (N_SAMPLES + CP_SAMPLES) // Полный размер кадра в эфире (192 сэмпла)
 
 #define FREQ_TONE1 1200.0f
