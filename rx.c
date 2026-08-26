@@ -26,12 +26,15 @@ static complex_f prev_tone_integrals[NUM_DATA_TONES];
 static bool rx_phases_initialized = false;
 static uint32_t symbol_counter = 0;
 
+static uint32_t search_holdoff_counter = 0;
+
 void rx_init(void) {
     rx_current_state = RX_STATE_SEARCH;
     sync_buf_idx = 0; P.re = 0.0f; P.im = 0.0f; R_energy = 0.0f;
     freq_offset_hz = 0.0f; guard_sample_cnt = 0; data_sample_cnt = 0; samples_since_sync = 0;
     samples_to_wait = 0; dpll_error_accumulator = 0.0f; current_target_data_samples = N_SAMPLES;
     rx_phases_initialized = false; symbol_counter = 0;
+    search_holdoff_counter = 0;
     for (int i = 0; i < N_SAMPLES; i++) {
         sync_buffer[i].re = 0.0f; sync_buffer[i].im = 0.0f;
         data_buffer[i].re = 0.0f; data_buffer[i].im = 0.0f;
@@ -53,6 +56,14 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
     switch (rx_current_state) {
 
         case RX_STATE_SEARCH: {
+            if (search_holdoff_counter > 0) {
+                search_holdoff_counter--;
+
+                // Обязательно обновляем кольцевой буфер, чтобы вытеснить старый сигнал
+                sync_buffer[sync_buf_idx] = x_curr;
+                sync_buf_idx = (sync_buf_idx + 1) % N_SAMPLES;
+                break;
+            }
             uint32_t idx_half = (sync_buf_idx + HALF_N) % N_SAMPLES;
             uint32_t idx_full = sync_buf_idx;
 
@@ -202,11 +213,20 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
                     samples_to_wait = CP_SAMPLES;
                 }
 
+                if (decoded_nibble != 0x0F) {
+                	printf ("Decoded nibble: 0x%X\n", decoded_nibble);
+                } else {
+                	printf ("EOT detected\n");
+                }
+
                 // Проверка флага завершения передачи по маркеру EOT
                 if (rx_phases_initialized && decoded_nibble == 0x0F) {
                     printf("[FSM Завершение] Получен маркер EOT. Поток остановлен.\n");
                     rx_current_state = RX_STATE_SEARCH;
                     rx_phases_initialized = false;
+
+                    // Запрещаем Шмидлу-Коксу работать следующие 800 сэмплов (100 мс тишины)
+                    search_holdoff_counter = 800;
                     return true;
                 }
 
