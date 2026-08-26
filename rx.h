@@ -13,7 +13,7 @@ typedef enum {
 } rx_state_t;
 
 #define SLIDING_WIN_LEN 128 // Выросло до 128 для когерентной устойчивости
-#define SEARCH_WIN_LEN 16  // Возвращаем ультра-короткое окно для нечувствительности к КВ-дрейфу!
+#define SEARCH_WIN_LEN 160  // Возвращаем ультра-короткое окно для нечувствительности к КВ-дрейфу!
 
 
 extern float dds_sine_table[];
