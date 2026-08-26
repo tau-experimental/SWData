@@ -47,29 +47,31 @@ void tx_get_next_iq_sample(tx_state_t state, complex_f *out) {
 		}; break;
 
     	case TX_STATE_DATA: {
-            uint32_t logic_sample_idx = tx_sample_counter;
+    	    // Время непрерывно растет от 0 до 191 на протяжении ВСЕГО кадра данных (CP + ТЕЛО)
+    	    // Чтобы в начале (от 0 до 31) получился хвост символа, мы вводим фазовый сдвиг назад
+    	    // на величину (N_SAMPLES - CP_SAMPLES)
 
-            // Циклический префикс (CP)
-            if (tx_sample_counter < CP_SAMPLES) {
-                logic_sample_idx = tx_sample_counter + (N_SAMPLES - CP_SAMPLES);
-            } else {
-                logic_sample_idx = tx_sample_counter - CP_SAMPLES;
-            }
+    	    float t_base = (float)tx_sample_counter / FS;
 
-            float t = (float)logic_sample_idx / FS;
+    	    // Суммируем плотный, ортогональный OFDM-аккорд
+    	    for (int tone = 0; tone < NUM_DATA_TONES; tone++) {
+    	        float tone_freq = data_tones[tone];
+    	        float phase_modifier = (tx_tone_phases[tone] == 1) ? -1.0f : 1.0f;
 
-            // Суммируем полноценный OFDM-аккорд
-            for (int tone = 0; tone < NUM_DATA_TONES; tone++) {
-                float phase_modifier = (tx_tone_phases[tone] == 1) ? -1.0f : 1.0f;
+    	        // Математически строгий непрерывный циклический префикс:
+    	        // Сдвигаем фазу каждого тона так, чтобы префикс идеально совпал с хвостом
+    	        float cp_phase_shift = 2.0f * PI_F * tone_freq * ((float)(N_SAMPLES - CP_SAMPLES) / FS);
 
-                out->re += 0.25f * cosf(2.0f * PI_F * data_tones[tone] * t) * phase_modifier;
-                out->im += 0.25f * sinf(2.0f * PI_F * data_tones[tone] * t) * phase_modifier;
-            }
+    	        float angle = 2.0f * PI_F * tone_freq * t_base - cp_phase_shift;
 
-            tx_sample_counter++;
-            if (tx_sample_counter >= TOTAL_SYMBOL_SAMPLES) {
-                tx_sample_counter = 0; // Сброс по границе символа
-            }
+    	        out->re += 0.25f * cosf(angle) * phase_modifier;
+    	        out->im += 0.25f * sinf(angle) * phase_modifier;
+    	    }
+
+    	    tx_sample_counter++;
+    	    if (tx_sample_counter >= TOTAL_SYMBOL_SAMPLES) {
+    	        tx_sample_counter = 0; // Сброс строго по границе полного кадра (192 сэмпла)
+    	    }
         }; break;
 
     	default: return;
