@@ -20,7 +20,7 @@ void tx_init(void) {
     uint32_t tx_sample_counter = 0;
 }
 
-#define DRIFT	-(0*536870) // 10Hz
+#define DRIFT	-(1*536870) // 10Hz
 
 // Шаги приращения фазы для 32-битного DDS при FS=8000 Гц
 static const uint32_t dds_increments[NUM_DATA_TONES] = {
