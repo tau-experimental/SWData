@@ -3,60 +3,60 @@
 #include "rx.h"
 #include "wav_io.h"
 #include <stdio.h>
-
-// Набор тестовых нибблов для проверки физики
-#define TEST_SUITE_SIZE 6
-static const uint8_t test_sequence[TEST_SUITE_SIZE] = {
-    0x0, // Сплошные нули (все фазы шагают назад на -90)
-    0x0, // Снова нули (проверка слепоты приёмника)
-    0xF, // Сплошные единицы (все фазы шагают вперед на +90)
-    0xF, // Снова единицы
-    0x5, // Каша 0101
-    0xA  // Каша 1010
-};
+#include <stdlib.h>
+#include <math.h>
 
 int main(void) {
-    printf("=== ЛАБОРАТОРНЫЙ СТЕНД: ПРОВЕРКА КВАДРАТУРНОГО ШАГА DDS/DPSK ===\n");
+    printf("=== ЛАБОРАТОРНЫЙ СТЕНД: АДАПТИВНАЯ ПРЕАМБУЛА НА РАБОЧИХ ЧАСТОТАХ ===\n");
 
     tx_init();
     rx_init();
 
-    FILE *wav_out = wav_open_write("laboratory.wav", FS);
-    complex_f data_buffer[N_SAMPLES];
+    FILE *wav_out = wav_open_write("preamble_test.wav", FS);
 
-    // Шагаем по нашей тестовой последовательности символов
-    for (int smb = 0; smb < TEST_SUITE_SIZE; smb++) {
-        uint8_t target_nibble = test_sequence[smb];
+    // Искусственно задаем КВ-дрейф для проверки калибровки
+    float simulated_kv_drift = -22.40f;
+    uint32_t global_sample_idx = 0;
+    int16_t iq_frame[2];
 
-        // 1. ПЕРЕДАТЧИК: переключает фазы DDS для текущего ниббла
-        tx_step_phase(target_nibble);
+    // 1. ГЕНЕРАЦИЯ: Симулируем 300 сэмплов начального КВ шума (без полезного сигнала)
+    for(int i=0; i<300; i++) {
+        complex_f noise_sample = { 0, 0 };
+        // Чистый шум малой амплитуды
+        noise_sample.re = (((float)rand() / RAND_MAX) - 0.5f) * 0.02f;
+        noise_sample.im = (((float)rand() / RAND_MAX) - 0.5f) * 0.02f;
+        iq_frame[0] = (int16_t)(noise_sample.re * 16384.0f);
+        iq_frame[1] = (int16_t)(noise_sample.im * 16384.0f);
+        fwrite(iq_frame, sizeof(int16_t), 2, wav_out);
 
-        printf("\n--- СИМВОЛ №%d: Передаём ниббл 0x%X ---\n", smb + 1, target_nibble);
+        rx_process_sample(&noise_sample, NULL);
+        rx_process_sample(&noise_sample, NULL);
+        global_sample_idx++;
+    }
+
+    // 2. ГЕНЕРАЦИЯ: Отправляем 10 символов преамбулы 0xA5
+    for (int smb = 0; smb < PREAMBLE_SYMBOLS; smb++) {
+        // Качаем фазы DDS рабочих частот
+        tx_step_phase(PREAMBLE_PATTERN);
 
         for (int i = 0; i < TOTAL_SYMBOL_SAMPLES; i++) {
             complex_f sample;
-
-            // ВЫЗЫВАЕМ ЧИСТЫЙ DDS ГЕНЕРАТОР:
             tx_get_sample(&sample);
 
-            // Пишем стерео-сэмпл в WAV для визуального контроля
-            int16_t wav_frame[2];
-            wav_frame[0] = (int16_t)(sample.re * 16384.0f);
-            wav_frame[1] = (int16_t)(sample.im * 16384.0f);
-            fwrite(wav_frame, sizeof(int16_t), 2, wav_out);
+            // Накладываем КВ-дрейф частоты
+            float t = (float)global_sample_idx / FS;
+            float phase = 2.0f * PI_F * simulated_kv_drift * t;
+            complex_f distorted_sample;
+            distorted_sample.re = sample.re * cosf(phase) - sample.im * sinf(phase);
+            distorted_sample.im = sample.re * sinf(phase) + sample.im * cosf(phase);
 
-            // Приёмник копит в ДПФ-буфер только чистые сэмплы тела
-            if (i >= CP_SAMPLES) {
-                data_buffer[i - CP_SAMPLES] = sample;
-            }
-        }
+            iq_frame[0] = (int16_t)(distorted_sample.re * 16384.0f);
+            iq_frame[1] = (int16_t)(distorted_sample.im * 16384.0f);
+            fwrite(iq_frame, sizeof(int16_t), 2, wav_out);
 
-        // 3. ДЕМОДУЛЯЦИЯ: Запускаем чистый ДПФ-анализ накопленного буфера
-        uint8_t rx_nibble = rx_decode_symbol(data_buffer, smb);
-
-        if (smb > 0) { // Пропускаем первый стартовый символ-калибровку
-            printf("[РЕЗУЛЬТАТ] Передано: 0x%X | Принято: 0x%X -> %s\n",
-                   target_nibble, rx_nibble, (target_nibble == rx_nibble) ? "ИДЕАЛЬНО" : "ОШИБКА");
+            // Скармливаем приёмнику по одному сэмплу
+            rx_process_sample(&distorted_sample, NULL);
+            global_sample_idx++;
         }
     }
 

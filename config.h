@@ -19,6 +19,10 @@
 #define NUM_DATA_TONES 4
 extern const float data_tones[NUM_DATA_TONES];
 
+// ПАРАМЕТРЫ ПРЕАМБУЛЫ
+#define PREAMBLE_SYMBOLS 10   // Длина преамбулы в символах
+#define PREAMBLE_PATTERN 0xA5 // Паттерн "качания" фаз (10100101)
+
 #define PI_F 3.14159265f
 #define SILENCE_SAMPLES 320
 

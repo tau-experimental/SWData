@@ -7,6 +7,7 @@ const float data_tones[NUM_DATA_TONES] = {1000.0f, 1200.0f, 1400.0f, 1600.0f};
 static float dds_sine_table[SINE_TABLE_SIZE];
 static uint32_t dds_phase_acc[NUM_DATA_TONES];
 static uint8_t dds_phase_shifts[NUM_DATA_TONES];
+static uint32_t tx_sample_counter = 0;
 
 void tx_init(void) {
     for (int i = 0; i < SINE_TABLE_SIZE; i++) {
@@ -16,6 +17,7 @@ void tx_init(void) {
         dds_phase_acc[i] = 0;
         dds_phase_shifts[i] = 0;
     }
+    uint32_t tx_sample_counter = 0;
 }
 
 // Шаги приращения фазы для 32-битного DDS при FS=8000 Гц
@@ -37,6 +39,7 @@ void tx_step_phase(uint8_t nibble) {
             dds_phase_shifts[tone] = (dds_phase_shifts[tone] + PHASE_90_SHIFT) % SINE_TABLE_SIZE;
         }
     }
+    uint32_t tx_sample_counter = 0;
 }
 
 void tx_get_sample(complex_f *out) {
