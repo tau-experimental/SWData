@@ -2,6 +2,8 @@
 #define TX_H
 
 #include <stdint.h>
+#include <stdbool.h>
+#include "config.h"
 
 // Состояния модулятора
 typedef enum {
@@ -12,9 +14,10 @@ typedef enum {
 
 // Инициализация передатчика
 void tx_init(void);
+void tx_init_payload(void);
 
-// Потоковый генератор: возвращает один сэмпл за один вызов
-// бит `data_bit` используется только в состоянии TX_STATE_DATA
-int16_t tx_get_next_sample(tx_state_t state, uint8_t data_bit);
+void tx_set_data_nibble(uint8_t nibble);
+
+void tx_get_next_iq_sample(tx_state_t state, complex_f *out);
 
 #endif // TX_H

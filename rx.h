@@ -3,11 +3,12 @@
 
 #include <stdint.h>
 #include <stdbool.h>
+#include "config.h"
 
 // Состояния приемника
 typedef enum {
     RX_STATE_SEARCH,      // Поиск преамбулы (автокорреляция)
-    RX_STATE_GUARD,       // Ожидание защитного интервала
+    RX_STATE_GUARD,       // Ожидание/пропуск защитного интервала
     RX_STATE_DECODE       // Демодуляция символов данных
 } rx_state_t;
 
@@ -17,6 +18,7 @@ void rx_init(void);
 // Возвращает true, если в этот момент был успешно декодирован бит данных
 // потоковый алгоритм Шмидла-Кокса
 bool rx_process_sample(int16_t sample, uint8_t *out_bit);
+bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_bit);
 
 // Получить текущую оценку сдвига частоты в Гц (доступно после захвата преамбулы)
 float rx_get_frequency_offset(void);
