@@ -69,54 +69,76 @@ void execute_global_dft(complex_f *buffer, uint32_t start_time, complex_f *resul
     }
 }
 
-bool rx_process_sample(complex_f *sample, uint8_t *out_nibble) {
-    complex_f x_curr = *sample;
+void rx_process_sample(complex_f *sample, uint8_t *result_nibble) {
+    uint32_t current_tick = rx_global_timer;
     rx_global_timer++;
 
-    // Скользящее окно кадра данных
-    for(int i = 0; i < TOTAL_SYMBOL_SAMPLES - 1; i++) data_buffer[i] = data_buffer[i+1];
-    data_buffer[TOTAL_SYMBOL_SAMPLES - 1] = x_curr;
+    int head = current_tick % TOTAL_SYMBOL_SAMPLES;
+    data_buffer[head] = *sample;
 
-    if (rx_global_timer > (SEARCH_WIN_LEN * 2)) {
-        complex_f dft_win_A[NUM_DATA_TONES];
-        complex_f dft_win_B[NUM_DATA_TONES];
+    if (current_tick < (SEARCH_WIN_LEN * 2)) return;
 
-        int offset_A = TOTAL_SYMBOL_SAMPLES - SEARCH_WIN_LEN;
-        int offset_B = TOTAL_SYMBOL_SAMPLES - (SEARCH_WIN_LEN * 2);
+    complex_f local_win_A[SEARCH_WIN_LEN];
+    complex_f local_win_B[SEARCH_WIN_LEN];
 
-        uint32_t time_A_start = rx_global_timer - SEARCH_WIN_LEN + 1;
-        uint32_t time_B_start = rx_global_timer - (SEARCH_WIN_LEN * 2) + 1;
+    for (int i = 0; i < SEARCH_WIN_LEN; i++) {
+        int idx_A = (head - SEARCH_WIN_LEN + i + TOTAL_SYMBOL_SAMPLES) % TOTAL_SYMBOL_SAMPLES;
+        int idx_B = (head - (SEARCH_WIN_LEN * 2) + i + TOTAL_SYMBOL_SAMPLES) % TOTAL_SYMBOL_SAMPLES;
+        local_win_A[i] = data_buffer[idx_A];
+        local_win_B[i] = data_buffer[idx_B];
+    }
 
-        // Считаем ДПФ с честной fmodf-тригонометрией
-        calc_sliding_dft(&data_buffer[offset_A], SEARCH_WIN_LEN, time_A_start, dft_win_A);
-        calc_sliding_dft(&data_buffer[offset_B], SEARCH_WIN_LEN, time_B_start, dft_win_B);
+    uint32_t time_A_start = current_tick - SEARCH_WIN_LEN;
+    uint32_t time_B_start = current_tick - (SEARCH_WIN_LEN * 2);
 
-        float signal_detection_index = 0.0f;
+    complex_f dft_win_A[NUM_DATA_TONES];
+    complex_f dft_win_B[NUM_DATA_TONES];
 
-        for (int t = 0; t < NUM_DATA_TONES; t++) {
-            float mag_A_sq = dft_win_A[t].re * dft_win_A[t].re + dft_win_A[t].im * dft_win_A[t].im;
-            float mag_B_sq = dft_win_B[t].re * dft_win_B[t].re + dft_win_B[t].im * dft_win_B[t].im;
+    calc_sliding_dft(local_win_A, SEARCH_WIN_LEN, time_A_start, dft_win_A);
+    calc_sliding_dft(local_win_B, SEARCH_WIN_LEN, time_B_start, dft_win_B);
 
-            if (mag_A_sq > 0.001f && mag_B_sq > 0.001f) {
-                float dot_re = dft_win_A[t].re * dft_win_B[t].re + dft_win_A[t].im * dft_win_B[t].im;
-                float cos_diff = dot_re / sqrtf(mag_A_sq * mag_B_sq);
+    float signal_detection_index = 0.0f;
+    float tone_jumps[NUM_DATA_TONES] = {0};
 
-                signal_detection_index += (1.0f - fabsf(cos_diff));
-            }
-        }
+    for (int t = 0; t < NUM_DATA_TONES; t++) {
+        float phi_A = atan2f(dft_win_A[t].im, dft_win_A[t].re);
+        float phi_B = atan2f(dft_win_B[t].im, dft_win_B[t].re);
 
-        // Если метрика подскочила, и мы еще не рапортовали об этом клике в данном окне
-        // Порог 2.5f–2.6f оптимален для коротких окон 16 сэмплов
-        if (signal_detection_index > 2.5f && (rx_global_timer - last_click_tick) > 32) {
-            uint32_t exact_click_sample = rx_global_timer - SEARCH_WIN_LEN;
-            uint32_t delta_from_last = exact_click_sample - last_click_tick;
+        float d_phi = phi_A - phi_B;
+        if (d_phi > PI_F)  d_phi -= 2.0f * PI_F;
+        if (d_phi < -PI_F) d_phi += 2.0f * PI_F;
 
-            printf("[КЛИК ФАЗЫ] Абс. сэмпл: #%u | Дистанция от прошлого: %u сэмплов | Метрика: %.2f\n",
-                   exact_click_sample,
-                   (last_click_tick == 0) ? 0 : delta_from_last,
-                   signal_detection_index);
+        static float reference_d_phi;
+        if (t == 0) {
+            reference_d_phi = d_phi;
+            tone_jumps[t] = d_phi;
+        } else {
+            float true_jump = d_phi - reference_d_phi;
+            if (true_jump > PI_F)  true_jump -= 2.0f * PI_F;
+            if (true_jump < -PI_F) true_jump += 2.0f * PI_F;
 
-            last_click_tick = exact_click_sample;
+            tone_jumps[t] = true_jump;
+            signal_detection_index += fabsf(true_jump);
         }
     }
+
+    static uint32_t last_click_tick = 0;
+
+    // Уменьшаем Hold-защиту до 32 сэмплов, чтобы увидеть МАКСИМУМ структуры сигнала
+    if (signal_detection_index > 2.0f && (current_tick - last_click_tick) > 32) {
+        uint32_t exact_click_sample = current_tick - SEARCH_WIN_LEN;
+        uint32_t delta_from_last = exact_click_sample - last_click_tick;
+
+        printf("[ОСЦИЛЛОГРАФ] Сэмпл: #%u | Шаг: %u | Метрика: %.2f | Сдвиги фаз тонов: [1000]=%.2f, [1200]=%.2f, [1400]=%.2f, [1600]=%.2f\n",
+               exact_click_sample,
+               (last_click_tick == 0) ? 0 : delta_from_last,
+               signal_detection_index,
+               tone_jumps[0] * 180.0f / PI_F,  // Переводим в градусы для наглядности
+               tone_jumps[1] * 180.0f / PI_F,
+               tone_jumps[2] * 180.0f / PI_F,
+               tone_jumps[3] * 180.0f / PI_F);
+
+        last_click_tick = exact_click_sample;
+    }
 }
+
