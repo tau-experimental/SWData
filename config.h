@@ -11,6 +11,10 @@
 #define FREQ_TONE1 1200.0f
 #define FREQ_TONE2 1800.0f
 
+#define SINE_TABLE_SIZE 256
+#define PHASE_180_SHIFT 128
+#define PHASE_90_SHIFT 64
+
 // Частоты тонов для данных (OFDM сетка)
 #define NUM_DATA_TONES 4
 extern const float data_tones[NUM_DATA_TONES];

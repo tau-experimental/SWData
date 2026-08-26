@@ -14,13 +14,6 @@ typedef enum {
 
 void rx_init(void);
 
-// Потоковый обработчик: принимает один сэмпл из АЦП
-// Возвращает true, если в этот момент был успешно декодирован бит данных
-// потоковый алгоритм Шмидла-Кокса
-bool rx_process_sample(int16_t sample, uint8_t *out_bit);
-bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_bit);
-
-// Получить текущую оценку сдвига частоты в Гц (доступно после захвата преамбулы)
-float rx_get_frequency_offset(void);
+uint8_t rx_decode_symbol(complex_f *data_buffer, uint32_t absolute_symbol_idx);
 
 #endif // RX_H
