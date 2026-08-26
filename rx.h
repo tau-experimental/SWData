@@ -45,4 +45,55 @@ uint8_t rx_decode_symbol(complex_f *data_buffer, uint32_t absolute_symbol_idx);
 
 extern float dpll_error_accumulator;
 
+#define ALPHA_POLE 0.98058f   // Полоса BPF ~50 Гц при Fs=8000
+#define HOLD_TIME_SAMPLES 24  // Окно удержания Hold-триггера
+#define LOOP_GAIN 0.02f       // Коэффициент фильтра петли АПЧ (скорость сходимости)
+
+// ============================================================================
+// СТРУКТУРЫ ХРАНЕНИЯ СОСТОЯНИЙ КАСКАДОВ (КОНТЕКСТЫ)
+// ============================================================================
+
+// Каскад 1: Входной комплексный смеситель АПЧ
+typedef struct {
+    float phase;             // Текущая фаза гетеродины [-PI, PI]
+    float freq_correction;   // Накопленная коррекция частоты (freq.delta) в рад/сэмпл
+} mixer_stage_t;
+
+typedef struct {
+    float freq_target;
+    float R_coeff;
+    float K_coeff;
+    float gain_scale;
+
+    // Каскад А (Звено 1)
+    float i_a1; float i_a2;
+    float q_a1; float q_a2;
+
+    // Каскад Б (Звено 2) - Включен последовательно после А
+    float i_b1; float i_b2;
+    float q_b1; float q_b2;
+
+    complex_f y_curr;
+    complex_f y_prev;
+} bpf_stage_t;
+
+
+extern bpf_stage_t rx_bpf_bank[];
+extern float ch_cfo_estimates[];
+extern float debug_smooth_cfo_hz, smooth_cfo_rad;
+extern float last_total_theta[];
+extern float phase_stability_acc[];
+
+// Каскад 4: Независимый фазовый детектор
+typedef struct {
+    float last_phase;        // Предыдущее значение фазы
+    uint32_t hold_counter;   // Таймер оконного удержания
+    bool is_switching;       // Флаг детекции скачка фазы в канале
+} pd_stage_t;
+
+float rx_debug_get_ch_cfo(int tone_idx);
+float rx_debug_get_mixer_correction_hz(void);
+bool  rx_debug_get_ch_switching(int tone_idx);
+void rx_pipeline_init(void);
+
 #endif // RX_H

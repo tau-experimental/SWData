@@ -2,127 +2,111 @@
 #include <stdlib.h>
 #include <math.h>
 #include <stdbool.h>
-#include <time.h>
-#include <inttypes.h>
 
-// Временные структуры, если они еще не объявлены в config.h
-typedef struct {
-    float re;
-    float im;
-} complex_f;
+#include "config.h"
+#include "tx.h"
+#include "rx.h"
+#include "wav_io.h"
 
-#define FS 8000.0f
-#define NUM_DATA_TONES 4
-#define PI_F 3.1415926535f
+// Внешние функции конвейера из rx.c
+extern void rx_pipeline_init(void);
+extern void stage2_bpf_filter(int tone_idx, const complex_f *input);
 
-// Внешние функции из rx.c, которые мы тестируем
-extern void rx_filters_init(void);
-extern void rx_filters_process_sample(const complex_f *in_sample);
 
-// Доступ к внутренним структурам каналов для логирования тестовых метрик
-typedef struct {
-    float freq_target;
-    float cos_w0;
-    float sin_w0;
-    complex_f y_prev;
-    complex_f y_delayed;
-    float cfo_error_hz;
-    float phase_jump_metric;
-    uint32_t hold_counter;
-    bool is_switching;
-} channel_filter_t;
 
-extern channel_filter_t rx_channels[NUM_DATA_TONES];
-
-// Генератор белого гауссова шума (метод Бокса-Мюллера)
-static float generate_gaussian_noise(float sigma) {
+// Генератор белого шума (Бокс-Мюллер)
+static float get_noise(float sigma) {
     if (sigma <= 0.0f) return 0.0f;
     float u1 = (float)rand() / (float)RAND_MAX;
     float u2 = (float)rand() / (float)RAND_MAX;
-    if (u1 < 1e-9f) u1 = 1e-9f; // защита от логарифма нуля
+    if (u1 < 1e-9f) u1 = 1e-9f;
     return sigma * sqrtf(-2.0f * logf(u1)) * cosf(2.0f * PI_F * u2);
 }
 
-int main(void) {
-    srand((unsigned int)time(NULL));
+void run_bpf_test_scenario(const char* name, float test_freq, float noise_level, const char* out_wave_pfx) {
+    printf("\n--- Запуск подкаста: %s (Сигнал: %.1f Гц, Шум: %.2f) ---\n", name, test_freq, noise_level);
 
-    // Инициализация тестируемого RX-каскада
-    rx_filters_init();
+    rx_pipeline_init(); // Сброс всех фильтров перед тестом
 
-    printf("\n============== ЗАПУСК СТРЕСС-ТЕСТА ФИЛЬТРОВ И ФАПЧ ==============\n");
+    // Открываем WAV-файлы для записи результатов
+    char fn_in[128], fn_f1[128], fn_f2[128];
+    sprintf(fn_in, "%s_input.wav", out_wave_pfx);
+    sprintf(fn_f1, "%s_output_bpf1000.wav", out_wave_pfx);
+    sprintf(fn_f2, "%s_output_bpf1200.wav", out_wave_pfx);
 
-    // ПАРАМЕТРЫ СТРЕСС-ТЕСТА
-    const float sim_cfo_hz = 35.0f;     // Намеренная КВ-расстройка частоты (35 Гц)
-    const float noise_sigma = 0.4f;     // Мощный шум в канале (SNR около 5-6 дБ)
-    const int sim_duration_samples = 1200; // Общая длительность симуляции
+    FILE* f_in = wav_open_write(fn_in, (uint32_t)FS);
+    FILE* f_f1 = wav_open_write(fn_f1, (uint32_t)FS);
+    FILE* f_f2 = wav_open_write(fn_f2, (uint32_t)FS);
 
-    // Локальные фазы генераторов передатчика для 4-х тонов
-    float tx_phases[NUM_DATA_TONES] = {0.0f, 0.0f, 0.0f, 0.0f};
-    float tone_frequencies[NUM_DATA_TONES] = {1000.0f, 1200.0f, 1400.0f, 1600.0f};
+    float tx_phase = 0.0f;
+    const int test_len = 12000; // 1.5 секунды записи для Audacity
+    printf ("Начало прогона: tx_phase: %+2.2f, test_freq = %4.1f, noise level = %2.2f\n", tx_phase, test_freq, noise_level);
 
-    printf("[SIM] Входные условия: CFO = +%.1f Гц, Шум (Sigma) = %.2f\n", sim_cfo_hz, noise_sigma);
-    printf("[SIM] На сэмпле 400 ломаем синхронность: искусственно сдвигаем фазы тонов!\n\n");
-
-    // Основной цикл симуляции по сэмплам
-    for (int n = 0; n < sim_duration_samples; n++) {
+    for (int n = 0; n < test_len; n++) {
         complex_f tx_signal = {0.0f, 0.0f};
 
-        // --- ИМИТАЦИЯ НАМЕРЕННОЙ ПОРЧИ СИГНАЛА НА ПЕРЕДАТЧИКЕ ---
-        // На сэмпле 400 имитируем "честный" асинхронный скачок фазы
-        if (n == 400) {
-            printf("\n⚠️ [TX МАНЕВР] Сэмпл %d: Происходит независимый скачок фаз в каналах!\n", n);
-            tx_phases[0] += PI_F / 2.0f;  // Тон 1: +90 градусов
-            tx_phases[1] -= PI_F / 2.0f;  // Тон 2: -90 градусов
-            tx_phases[2] += PI_F;         // Тон 3: 180 градусов (инверсия)
-            tx_phases[3] += PI_F / 4.0f;  // Тон 4: +45 градусов
+        // Генерируем тестовый тон, если частота > 0
+        if (test_freq > 0.0f) {
+            tx_phase += 2.0f * PI_F * test_freq / FS;
+            if (tx_phase > PI_F) tx_phase -= 2.0f * PI_F;
+            tx_signal.re = cosf(tx_phase);
+            tx_signal.im = sinf(tx_phase);
         }
 
-        // Синтезируем групповой КВ-сигнал с учетом CFO
+        // Добавляем шум, если задан
+        tx_signal.re += get_noise(noise_level);
+        tx_signal.im += get_noise(noise_level);
+
+        // Записываем то, что летит на вход фильтрам
+        wav_write_sample(f_in, tx_signal.re, tx_signal.im);
+
+        // Пропускаем СТАТИЧЕСКИЙ сигнал через независимые фильтры (БЕЗ АПЧ!)
         for (int t = 0; t < NUM_DATA_TONES; t++) {
-            // Реальная мгновенная частота тона в эфире с учетом расстройки CFO
-            float real_freq = tone_frequencies[t] + sim_cfo_hz;
-            float step = 2.0f * PI_F * real_freq / FS;
-
-            tx_phases[t] += step;
-            // Удерживаем фазу в пределах [-PI, PI] для точности float
-            if (tx_phases[t] > PI_F)  tx_phases[t] -= 2.0f * PI_F;
-            if (tx_phases[t] < -PI_F) tx_phases[t] += 2.0f * PI_F;
-
-            // Накапливаем комплексную смесь 4-х тонов
-            tx_signal.re += cosf(tx_phases[t]);
-            tx_signal.im += sinf(tx_phases[t]);
+            stage2_bpf_filter(t, &tx_signal);
         }
 
-        // Нормализуем амплитуду суммы тонов, чтобы она не улетала в клиппинг
-        tx_signal.re /= (float)NUM_DATA_TONES;
-        tx_signal.im /= (float)NUM_DATA_TONES;
+        // оцениваем частотный сдвиг
+        stage3_frequency_assessment();
 
-        // Добавляем аддитивный белый гауссов шум (AWGN) в I и Q каналы
-        tx_signal.re += generate_gaussian_noise(noise_sigma);
-        tx_signal.im += generate_gaussian_noise(noise_sigma);
+        // Записываем выходы фильтра 1000 Гц и фильтра 1200 Гц
+        wav_write_sample(f_f1, rx_bpf_bank[0].y_curr.re, rx_bpf_bank[0].y_curr.im);
+        wav_write_sample(f_f2, rx_bpf_bank[1].y_curr.re, rx_bpf_bank[1].y_curr.im);
 
-        // --- ПРОПУСКАЕМ ЗАШУМЛЕННЫЙ СИГНАЛ ЧЕРЕЗ ФИЛЬТРЫ ПРИЕМНИКА ---
-        rx_filters_process_sample(&tx_signal);
+        // Короткий лог в консоль для визуального контроля амплитуд
+        if (n == 200 || (n % 1000)==0) {
+            float amp0 = sqrtf(rx_bpf_bank[0].y_curr.re*rx_bpf_bank[0].y_curr.re + rx_bpf_bank[0].y_curr.im*rx_bpf_bank[0].y_curr.im);
+            float amp1 = sqrtf(rx_bpf_bank[1].y_curr.re*rx_bpf_bank[1].y_curr.re + rx_bpf_bank[1].y_curr.im*rx_bpf_bank[1].y_curr.im);
+            float amp2 = sqrtf(rx_bpf_bank[2].y_curr.re*rx_bpf_bank[2].y_curr.re + rx_bpf_bank[2].y_curr.im*rx_bpf_bank[2].y_curr.im);
+            float amp3 = sqrtf(rx_bpf_bank[3].y_curr.re*rx_bpf_bank[3].y_curr.re + rx_bpf_bank[3].y_curr.im*rx_bpf_bank[3].y_curr.im);
+            printf("  [Сэмпл %04d] Амплитуда на выходах BPF: (%6.3f, %6.3f, %6.3f, %6.3f)\n",
+            		n, amp0, amp1, amp2, amp3);
 
-        // --- МОНИТОРИНГ И ЛОГИРОВАНИЕ ДИНАМИКИ ПОВЕДЕНИЯ ---
-        // Выводим состояние метрик каждые 50 сэмплов для отслеживания стабильности
-        if (n % 50 == 0 || n == 401 || n == 405 || n == 420) {
-            printf("[%04d] CFO Оценка: T1=%+5.1fГц | T2=%+5.1fГц | T3=%+5.1fГц | T4=%+5.1fГц  ",
-                   n,
-                   rx_channels[0].cfo_error_hz,
-                   rx_channels[1].cfo_error_hz,
-                   rx_channels[2].cfo_error_hz,
-                   rx_channels[3].cfo_error_hz);
-
-            // Вывод флагов детекции переключения фаз (Hold-окно)
-            printf("Флаги скачка: [%c%c%c%c]\n",
-                   rx_channels[0].is_switching ? 'X' : '.',
-                   rx_channels[1].is_switching ? 'X' : '.',
-                   rx_channels[2].is_switching ? 'X' : '.',
-                   rx_channels[3].is_switching ? 'X' : '.');
+            printf("  Оценка частотных сдвигов: (%+3.3f, %+3.3f, %+3.3f. %+3.3f)\n",
+            		ch_cfo_estimates[0], ch_cfo_estimates[1], ch_cfo_estimates[2], ch_cfo_estimates[3]);
+            printf("  smooth_cfo: %+4.2f Hz\n", debug_smooth_cfo_hz );
         }
     }
 
-    printf("\n============== ТЕСТ ЗАВЕРШЕН ==============\n");
+    wav_close(f_in);
+    wav_close(f_f1);
+    wav_close(f_f2);
+    printf("  Экспорт в файлы завершен успешно.\n");
+}
+
+int main(void) {
+	float shift = -32.0;
+    // Сценарий А: Чистый тон 1000 Гц (Должен ожить только BPF-1000)
+    run_bpf_test_scenario("Чистый тон 1000 Гц + сдвиг", 1000.0f + shift, 0.0f, "test_tone1000");
+
+    // Сценарий Б: Чистый тон 1200 Гц (Должен ожить только BPF-1200)
+    run_bpf_test_scenario("Чистый тон 1200 Гц + сдвиг", 1200.0f + shift, 0.0f, "test_tone1200");
+    run_bpf_test_scenario("Чистый тон 1400 Гц + сдвиг", 1400.0f + shift, 0.0f, "test_tone1400");
+    shift = 25.0;
+    run_bpf_test_scenario("Чистый тон 1600 Гц + сдвиг", 1600.0f + shift, 0.0f, "test_tone1600");
+
+    shift = 0.0;
+    // Сценарий В: Экстремальный белый шум без полезного сигнала
+    run_bpf_test_scenario("Чистый белый шум", 0.0f, 0.5f, "test_pure_noise");
+
     return 0;
 }
