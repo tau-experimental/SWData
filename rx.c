@@ -27,6 +27,8 @@ static bool rx_phases_initialized = false;
 static uint32_t symbol_counter = 0;
 
 static uint32_t search_holdoff_counter = 0;
+static uint32_t stream_timeout_counter = 0;
+
 
 void rx_init(void) {
     rx_current_state = RX_STATE_SEARCH;
@@ -35,6 +37,7 @@ void rx_init(void) {
     samples_to_wait = 0; dpll_error_accumulator = 0.0f; current_target_data_samples = N_SAMPLES;
     rx_phases_initialized = false; symbol_counter = 0;
     search_holdoff_counter = 0;
+    stream_timeout_counter = 0;
     for (int i = 0; i < N_SAMPLES; i++) {
         sync_buffer[i].re = 0.0f; sync_buffer[i].im = 0.0f;
         data_buffer[i].re = 0.0f; data_buffer[i].im = 0.0f;
@@ -98,6 +101,10 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
 
                     guard_sample_cnt = 0;
                     samples_since_sync = 0;
+                    // Взводим тайм-аут: если в течение 1500 сэмплов (около 7 символов)
+					// мы не зафиксируем "гарпун" или маркеры данных — автомат сбросится,
+					// посчитав детекцию ложной (хвост старого сигнала или всплеск шума)
+					stream_timeout_counter = 1500;
                     rx_current_state = RX_STATE_GUARD;
                 }
             }
@@ -106,6 +113,16 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
 
         case RX_STATE_GUARD: {
             guard_sample_cnt++;
+            // ТАЙМ-АУТ КОНТРОЛЯ: если полезный поток так и не начался, сбрасываемся
+            if (stream_timeout_counter > 0) {
+                stream_timeout_counter--;
+                if (stream_timeout_counter == 0) {
+                    printf("[FSM Тайм-аут] Ложный всплеск в хвосте. Возврат в SEARCH.\n");
+                    rx_init();
+                    break;
+                }
+            }
+
             if (guard_sample_cnt >= samples_to_wait) {
                 data_sample_cnt = 0;
                 rx_current_state = RX_STATE_DECODE;
@@ -225,8 +242,7 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
                     rx_current_state = RX_STATE_SEARCH;
                     rx_phases_initialized = false;
 
-                    // Запрещаем Шмидлу-Коксу работать следующие 800 сэмплов (100 мс тишины)
-                    search_holdoff_counter = 800;
+                    search_holdoff_counter = 1200;
                     return true;
                 }
 

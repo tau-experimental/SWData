@@ -115,6 +115,14 @@ int main(void) {
     // 5. ГЕНЕРАЦИЯ: Маркер Конца Передачи (EOT = 0x0F)
     transmit_single_nibble(0x0F, simulated_frequency_drift, &global_tx_counter, iq_frame, wav_file_out, &real_file_samples);
 
+    // 6. ГЕНЕРАЦИЯ: завершающая шумовая дорожка
+    random_silence_samples = 200 + (rand() % 800);
+    for (uint32_t i = 0; i < random_silence_samples; i++) {
+        apply_kv_channel_iq(&zero_signal, simulated_frequency_drift, global_tx_counter, &iq_frame[0], &iq_frame[1]);
+        write_sample_with_jitter(iq_frame, wav_file_out, &real_file_samples);
+        global_tx_counter++;
+    }
+
     wav_close_write(wav_file_out);
     printf("[Канал] Файл сгенерирован сквозь стохастический джиттер.\n\n");
 
