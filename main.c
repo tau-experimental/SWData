@@ -8,7 +8,9 @@
 
 // Функция записи сэмплов с эмуляцией джиттера тактовой частоты (Clock Jitter)
 void write_sample_with_jitter(int16_t *iq_frame, FILE *file, uint32_t *samples_written) {
-    // Генерируем случайное событие джиттера (вероятность 2%)
+
+#if 0
+	// Генерируем случайное событие джиттера (вероятность 2%)
     int r = rand() % 100;
 
     if (r == 0) {
@@ -24,10 +26,13 @@ void write_sample_with_jitter(int16_t *iq_frame, FILE *file, uint32_t *samples_w
         // (В эфире произошел микропропуск)
     }
     else {
+#endif
         // Нормальный режим (98% времени)
         fwrite(iq_frame, sizeof(int16_t), 2, file);
         (*samples_written)++;
+#if 0
     }
+#endif
 }
 
 // Эмулятор КВ канала: добавляет сдвиг частоты и шум

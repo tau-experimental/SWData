@@ -209,29 +209,32 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
 
                 // РАБОТА ПЕТЛИ DPLL И ВЫБОР ШАГА СЛЕДУЮЩЕГО КАДРА
                 if (rx_phases_initialized) {
-                    dpll_error_accumulator += total_timing_phase_error * 0.02f; // Коэффициент удержания петли
+
+                	// Увеличиваем скорость накопления ошибки фазы тактирования (Loop Gain = 0.08)
+                	dpll_error_accumulator += total_timing_phase_error * 0.08f;
+
                     printf("[DPLL Телеметрия] Суммарная ошибка фазы: %.3f | Интегратор петли: %.3f\n",
                            total_timing_phase_error, dpll_error_accumulator);
 
-                    if (dpll_error_accumulator > 1.0f) {
-                        // Приемник бежит быстрее передатчика -> укорачиваем следующий символ, беря меньше отсчетов АЦП
-                        current_target_data_samples = N_SAMPLES - 1;
-                        samples_to_wait = CP_SAMPLES;
+                    // Чувствительный порог: если фазовый увод веера векторов весом больше 150.0,
+                    // мгновенно корректируем временную границу СЛЕДУЮЩЕГО CP
+                    if (dpll_error_accumulator > 150.0f) {
+                        current_target_data_samples = N_SAMPLES;
+                        samples_to_wait = CP_SAMPLES - 1; // Сжимаем защитный интервал на 1 сэмпл, подтягивая ДПФ влево
                         dpll_error_accumulator = 0.0f;
-                        printf("[DPLL Автоматика] !!! КОРРЕКЦИЯ: ТАКТ СЖАТ ДО %u СЭМПЛОВ !!!\n", current_target_data_samples);
+                        printf("[DPLL Автоматика] !!! РЕГУЛИРОВКА ВРЕМЕНИ: ТАКТ СЖАТ (-1 сэмпл) !!!\n");
                     }
-                    else if (dpll_error_accumulator < -1.0f) {
-                        // Приемник отстает -> удлиняем следующий шаг
-                        current_target_data_samples = N_SAMPLES + 1;
-                        samples_to_wait = CP_SAMPLES;
+                    else if (dpll_error_accumulator < -150.0f) {
+                        current_target_data_samples = N_SAMPLES;
+                        samples_to_wait = CP_SAMPLES + 1; // Расширяем защитный интервал, сдвигая ДПФ вправо
                         dpll_error_accumulator = 0.0f;
-                        printf("[DPLL Автоматика] !!! КОРРЕКЦИЯ: ТАКТ РАСШИРЕН ДО %u СЭМПЛОВ !!!\n", current_target_data_samples);
+                        printf("[DPLL Автоматика] !!! РЕГУЛИРОВКА ВРЕМЕНИ: ТАКТ РАСШИРЕН (+1 сэмпл) !!!\n");
                     }
                     else {
-                        // Шагаем по стандартной сетке кадра
                         current_target_data_samples = N_SAMPLES;
                         samples_to_wait = CP_SAMPLES;
                     }
+
                 } else {
                     // Обработали первый ("гарпунный") символ
                     printf("[DPSK Базис] 'Гарпунный' символ успешно захвачен и сохранен как фазовая опора кадра.\n");
