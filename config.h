@@ -13,7 +13,7 @@
 
 // Частоты тонов для данных (OFDM сетка)
 #define NUM_DATA_TONES 4
-static const float data_tones[NUM_DATA_TONES] = {1000.0f, 1200.0f, 1400.0f, 1600.0f};
+extern const float data_tones[NUM_DATA_TONES];
 
 #define PI_F 3.14159265f
 #define SILENCE_SAMPLES 320

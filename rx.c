@@ -1,9 +1,11 @@
 #include "rx.h"
 #include "config.h"
+#include <stdio.h>
 #include <math.h>
 
-static complex_f rx_buffer[N_SAMPLES];
-static uint32_t buf_idx = 0;
+static complex_f sync_buffer[N_SAMPLES];
+static uint32_t sync_buf_idx = 0;
+static complex_f data_buffer[N_SAMPLES + 5]; // Запас по памяти для растяжения такта
 
 static rx_state_t rx_current_state = RX_STATE_SEARCH;
 static float freq_offset_hz = 0.0f;
@@ -14,26 +16,27 @@ static float R_energy = 0.0f;
 static uint32_t guard_sample_cnt = 0;
 static uint32_t data_sample_cnt = 0;
 static uint32_t samples_since_sync = 0;
+static uint32_t samples_to_wait = 0;
 
-// Переменные для поиска пика Шмидла-Кокса
-static float max_metric = 0.0f;
-static uint32_t peak_search_counter = 0;
-static uint32_t samples_to_data_start = 0;
-static uint32_t sample_counter_since_threshold = 0;
-static uint32_t peak_location_from_threshold = 0;
+// Переменные DPLL
+static float dpll_error_accumulator = 0.0f;
+static uint32_t current_target_data_samples = N_SAMPLES;
 
 static complex_f prev_tone_integrals[NUM_DATA_TONES];
 static bool rx_phases_initialized = false;
+static uint32_t symbol_counter = 0;
 
 void rx_init(void) {
     rx_current_state = RX_STATE_SEARCH;
-    buf_idx = 0; P.re = 0.0f; P.im = 0.0f; R_energy = 0.0f;
+    sync_buf_idx = 0; P.re = 0.0f; P.im = 0.0f; R_energy = 0.0f;
     freq_offset_hz = 0.0f; guard_sample_cnt = 0; data_sample_cnt = 0; samples_since_sync = 0;
-    max_metric = 0.0f; peak_search_counter = 0; samples_to_data_start = 0;
-    sample_counter_since_threshold = 0;
-    peak_location_from_threshold = 0;
-    rx_phases_initialized = false;
-    for (int i = 0; i < N_SAMPLES; i++) { rx_buffer[i].re = 0.0f; rx_buffer[i].im = 0.0f; }
+    samples_to_wait = 0; dpll_error_accumulator = 0.0f; current_target_data_samples = N_SAMPLES;
+    rx_phases_initialized = false; symbol_counter = 0;
+    for (int i = 0; i < N_SAMPLES; i++) {
+        sync_buffer[i].re = 0.0f; sync_buffer[i].im = 0.0f;
+        data_buffer[i].re = 0.0f; data_buffer[i].im = 0.0f;
+    }
+    printf("[FSM Init] Автомат сброшен. Состояние: RX_STATE_SEARCH. Ожидание сигнала...\n");
 }
 
 float rx_get_frequency_offset(void) { return freq_offset_hz; }
@@ -43,27 +46,22 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
     x_curr.re = (float)sample_i / 32768.0f;
     x_curr.im = (float)sample_q / 32768.0f;
 
-    if (rx_current_state != RX_STATE_SEARCH && rx_current_state != RX_STATE_PEAK_HOLD) {
+    if (rx_current_state != RX_STATE_SEARCH) {
         samples_since_sync++;
     }
-
-    uint32_t idx_half = (buf_idx + HALF_N) % N_SAMPLES;
-    uint32_t idx_full = buf_idx;
-
-    complex_f x_half = rx_buffer[idx_half];
-    complex_f x_full = rx_buffer[idx_full];
-
-    // В режимах поиска пика пишем сырые данные в буфер
-    if (rx_current_state == RX_STATE_SEARCH || rx_current_state == RX_STATE_PEAK_HOLD) {
-        rx_buffer[buf_idx] = x_curr;
-    }
-    uint32_t current_write_pos = buf_idx;
-    buf_idx = (buf_idx + 1) % N_SAMPLES;
 
     switch (rx_current_state) {
 
         case RX_STATE_SEARCH: {
-            // Рекурсивный расчет Шмидла-Кокса
+            uint32_t idx_half = (sync_buf_idx + HALF_N) % N_SAMPLES;
+            uint32_t idx_full = sync_buf_idx;
+
+            complex_f x_half = sync_buffer[idx_half];
+            complex_f x_full = sync_buffer[idx_full];
+
+            sync_buffer[sync_buf_idx] = x_curr;
+            sync_buf_idx = (sync_buf_idx + 1) % N_SAMPLES;
+
             float curr_conj_half_re = x_curr.re * x_half.re + x_curr.im * x_half.im;
             float curr_conj_half_im = x_curr.im * x_half.re - x_curr.re * x_half.im;
             float half_conj_full_re = x_half.re * x_full.re + x_half.im * x_full.im;
@@ -76,122 +74,64 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
             if (R_energy > 0.01f) {
                 float metric = (P.re * P.re + P.im * P.im) / (R_energy * R_energy);
 
-                // Порог первичного обнаружения сигнала
-                if (metric > 0.75f) {
-                    max_metric = metric;
-                    sample_counter_since_threshold = 0;
-                    peak_location_from_threshold = 0;
-
-                    // Сразу вычисляем частоту первого приближения
+                if (metric > 0.80f) {
                     float phase_diff = atan2f(P.im, P.re);
                     freq_offset_hz = phase_diff / (2.0f * PI_F * ((float)HALF_N / FS));
 
-                    rx_current_state = RX_STATE_PEAK_HOLD;
+                    // Жесткий расчет до конца преамбулы + первый CP
+                    samples_to_wait = (2 * N_SAMPLES - HALF_N) + CP_SAMPLES;
+
+                    printf("\n[FSM Детекция] Порог Шмидла-Кокса превышен! Метрика: %.3f\n", metric);
+                    printf("[FSM Детекция] Рассчитанный КВ-дрифт частоты: %.2f Гц\n", freq_offset_hz);
+                    printf("[FSM Переход] SEARCH -> GUARD. Ожидание паузы: %u сэмплов.\n", samples_to_wait);
+
+                    guard_sample_cnt = 0;
+                    samples_since_sync = 0;
+                    rx_current_state = RX_STATE_GUARD;
                 }
-            }
-            break;
-        }
-
-        case RX_STATE_PEAK_HOLD: {
-            // Продолжаем крутить Шмидла-Кокса внутри окна поиска максимума
-            float curr_conj_half_re = x_curr.re * x_half.re + x_curr.im * x_half.im;
-            float curr_conj_half_im = x_curr.im * x_half.re - x_curr.re * x_half.im;
-            float half_conj_full_re = x_half.re * x_full.re + x_half.im * x_full.im;
-            float half_conj_full_im = x_half.im * x_full.re - x_half.re * x_full.im;
-
-            P.re += curr_conj_half_re - half_conj_full_re;
-            P.im += curr_conj_half_im - half_conj_full_im;
-            R_energy += (x_half.re * x_half.re + x_half.im * x_half.im) - (x_full.re * x_full.re + x_full.im * x_full.im);
-
-            if (R_energy > 0.01f) {
-                float metric = (P.re * P.re + P.im * P.im) / (R_energy * R_energy);
-
-                // Если метрика растет, обновляем пик и точное значение частоты
-                if (metric > max_metric) {
-                    max_metric = metric;
-                    peak_location_from_threshold = sample_counter_since_threshold;
-
-                    // Обновляем точную КВ-частоту в точке наилучшего сигнала
-                    float phase_diff = atan2f(P.im, P.re);
-                    freq_offset_hz = phase_diff / (2.0f * PI_F * ((float)HALF_N / FS));
-                }
-            }
-
-            // Ищем пик на протяжении 240 сэмплов (это гарантированно покроет плато двух символов преамбулы)
-            if (sample_counter_since_threshold >= 240) {
-                guard_sample_cnt = 0;
-                samples_since_sync = 0;
-
-                // МАТЕМАТИЧЕСКИЙ РАСЧЕТ ТОЧКИ СТАРТА ДАННЫХ:
-                // Истинный пик плато Шмидла-Кокса находится ровно в точке,
-                // когда до конца преамбулы остается HALF_N (80) сэмплов.
-                // Зная, сколько сэмплов прошло с момента порога до конца окна поиска (sample_counter_since_threshold = 240),
-                // и где был пик (peak_location_from_threshold), вычисляем точный остаток пути до кадра данных:
-                int32_t remainder = (int32_t)peak_location_from_threshold + HALF_N - (int32_t)sample_counter_since_threshold;
-
-                // Если по шумам мы немного промахнулись, страхуем индекс, чтобы он не стал отрицательным
-                if (remainder < 0) remainder = 0;
-                samples_to_data_start = (uint32_t)remainder;
-
-                rx_current_state = RX_STATE_GUARD;
             }
             break;
         }
 
         case RX_STATE_GUARD: {
             guard_sample_cnt++;
-
-            // Компенсируем частоту на лету для залетающих сэмплов
-            float comp_t = (float)samples_since_sync / FS;
-            float comp_phase = -2.0f * PI_F * freq_offset_hz * comp_t;
-            complex_f x_comp;
-            x_comp.re = x_curr.re * cosf(comp_phase) - x_curr.im * sinf(comp_phase);
-            x_comp.im = x_curr.re * sinf(comp_phase) + x_curr.im * cosf(comp_phase);
-
-            rx_buffer[buf_idx] = x_comp;
-            buf_idx = (buf_idx + 1) % N_SAMPLES;
-
-            // Нам нужно пропустить остаток преамбулы (samples_to_data_start) + циклический префикс (CP_SAMPLES)
-            if (guard_sample_cnt >= (samples_to_data_start + CP_SAMPLES)) {
+            if (guard_sample_cnt >= samples_to_wait) {
                 data_sample_cnt = 0;
                 rx_current_state = RX_STATE_DECODE;
+                // Фазовая компенсация для ДПФ-окна всегда стартует локально с нуля
+                samples_since_sync = 0;
             }
             break;
         }
 
         case RX_STATE_DECODE: {
-            data_sample_cnt++;
-
+            // Компенсация частоты гетеродина КВ на лету
             float comp_t = (float)samples_since_sync / FS;
             float comp_phase = -2.0f * PI_F * freq_offset_hz * comp_t;
+
             complex_f x_comp;
             x_comp.re = x_curr.re * cosf(comp_phase) - x_curr.im * sinf(comp_phase);
-            x_comp.im = x_curr.re * sinf(comp_phase) + x_comp.im * cosf(comp_phase);
+            x_comp.im = x_curr.re * sinf(comp_phase) + x_curr.im * cosf(comp_phase);
 
-            rx_buffer[buf_idx] = x_comp;
-            uint32_t current_write_pos = buf_idx;
-            buf_idx = (buf_idx + 1) % N_SAMPLES;
+            data_buffer[data_sample_cnt] = x_comp;
+            data_sample_cnt++;
 
-            if (data_sample_cnt >= N_SAMPLES) {
+            // Слушаем динамическое окно, заданное DPLL на прошлом шаге!
+            if (data_sample_cnt >= current_target_data_samples) {
                 uint8_t decoded_nibble = 0;
+                float total_timing_phase_error = 0.0f;
+                symbol_counter++;
 
-                printf("\n=== ПОДРОБНАЯ ДИАГНОСТИКА ДПФ (Кадр Данных) ===\n");
-                printf("Измеренный дрифт для компенсации: %.2f Гц\n", freq_offset_hz);
-                printf("Индекс записи буфера (current_write_pos): %u\n", current_write_pos);
+                printf("\n--- АНАЛИЗ СИМВОЛА ПОТОКА №%u (Взято отсчетов АЦП: %u) ---\n",
+                       symbol_counter, current_target_data_samples);
 
-                // Если это самый первый символ, покажем как инициализируется предыстория
-                if (!rx_phases_initialized) {
-                    printf("[DPSK] Первый запуск. Инициализация фазового базиса условным нулем.\n");
-                }
-
+                // Вычисляем ДПФ строго по ортогональной сетке N_SAMPLES (160)
                 for (int tone = 0; tone < NUM_DATA_TONES; tone++) {
                     float tone_freq = data_tones[tone];
                     complex_f curr_tone_integral = {0.0f, 0.0f};
 
                     for (int i = 0; i < N_SAMPLES; i++) {
-                        uint32_t read_idx = (current_write_pos + 1 + i) % N_SAMPLES;
-                        complex_f clean_sample = rx_buffer[read_idx];
-
+                        complex_f clean_sample = data_buffer[i];
                         float t_window = (float)i / FS;
                         float cos_ref = cosf(2.0f * PI_F * tone_freq * t_window);
                         float sin_ref = sinf(2.0f * PI_F * tone_freq * t_window);
@@ -201,47 +141,82 @@ bool rx_process_iq_sample(int16_t sample_i, int16_t sample_q, uint8_t *out_nibbl
                     }
 
                     if (!rx_phases_initialized) {
-                        prev_tone_integrals[tone].re = 1.0f; // Принудительный вектор "вправо" для теста одного символа
-                        prev_tone_integrals[tone].im = 0.0f;
+                        prev_tone_integrals[tone] = curr_tone_integral;
+                    } else {
+                        float dot_product_re = curr_tone_integral.re * prev_tone_integrals[tone].re +
+                                               curr_tone_integral.im * prev_tone_integrals[tone].im;
+                        float dot_product_im = curr_tone_integral.im * prev_tone_integrals[tone].re -
+                                               curr_tone_integral.re * prev_tone_integrals[tone].im;
+
+                        if (dot_product_re < 0.0f) {
+                            decoded_nibble |= (1 << tone);
+                        }
+
+                        // Дискриминатор DPLL: оцениваем косину и фазовый увод вектора
+                        float tone_error = dot_product_im;
+                        if (dot_product_re < 0.0f) {
+                            tone_error = -tone_error;
+                        }
+                        total_timing_phase_error += tone_error * (float)(tone + 1);
+
+                        printf(" Тон %d (%4.0f Гц): ДПФ=[%6.2f, j(%6.2f)] | DPSK_RE=%6.2f, IM=%6.2f | БИТ=%d\n",
+                               tone, tone_freq, curr_tone_integral.re, curr_tone_integral.im,
+                               dot_product_re, dot_product_im, (dot_product_re < 0.0f) ? 1 : 0);
+
+                        prev_tone_integrals[tone] = curr_tone_integral;
                     }
-
-                    // Комплексное скалярное произведение Z = Curr * conj(Prev)
-                    float dot_product_re = curr_tone_integral.re * prev_tone_integrals[tone].re +
-                                           curr_tone_integral.im * prev_tone_integrals[tone].im;
-                    float dot_product_im = curr_tone_integral.im * prev_tone_integrals[tone].re -
-                                           curr_tone_integral.re * prev_tone_integrals[tone].im;
-
-                    // Определяем бит
-                    uint8_t decoded_bit = (dot_product_re < 0.0f) ? 1 : 0;
-                    if (decoded_bit) {
-                        decoded_nibble |= (1 << tone);
-                    }
-
-                    // Выводим геометрию векторов в консоль
-                    printf("Тон %d (%.0f Гц): \n", tone, tone_freq);
-                    printf("  -> Текущий вектор ДПФ : [%.4f, j(%.4f)] | Модуль: %.4f\n",
-                           curr_tone_integral.re, curr_tone_integral.im,
-                           sqrtf(curr_tone_integral.re*curr_tone_integral.re + curr_tone_integral.im*curr_tone_integral.im));
-                    printf("  -> Базисный вектор     : [%.4f, j(%.4f)]\n",
-                           prev_tone_integrals[tone].re, prev_tone_integrals[tone].im);
-                    printf("  -> Скалярное произв.   : RE = %.4f, IM = %.4f -> БИТ = %d\n",
-                           dot_product_re, dot_product_im, decoded_bit);
-
-                    // Сохраняем базу
-                    prev_tone_integrals[tone] = curr_tone_integral;
                 }
 
-                rx_phases_initialized = true;
-                *out_nibble = decoded_nibble;
-
                 data_sample_cnt = 0;
-                rx_current_state = RX_STATE_SEARCH;
-                rx_phases_initialized = false;
-                return true;
-            }
+
+                // РАБОТА ПЕТЛИ DPLL И ВЫБОР ШАГА СЛЕДУЮЩЕГО КАДРА
+                if (rx_phases_initialized) {
+                    dpll_error_accumulator += total_timing_phase_error * 0.02f; // Коэффициент удержания петли
+                    printf("[DPLL Телеметрия] Суммарная ошибка фазы: %.3f | Интегратор петли: %.3f\n",
+                           total_timing_phase_error, dpll_error_accumulator);
+
+                    if (dpll_error_accumulator > 1.0f) {
+                        // Приемник бежит быстрее передатчика -> укорачиваем следующий символ, беря меньше отсчетов АЦП
+                        current_target_data_samples = N_SAMPLES - 1;
+                        samples_to_wait = CP_SAMPLES;
+                        dpll_error_accumulator = 0.0f;
+                        printf("[DPLL Автоматика] !!! КОРРЕКЦИЯ: ТАКТ СЖАТ ДО %u СЭМПЛОВ !!!\n", current_target_data_samples);
+                    }
+                    else if (dpll_error_accumulator < -1.0f) {
+                        // Приемник отстает -> удлиняем следующий шаг
+                        current_target_data_samples = N_SAMPLES + 1;
+                        samples_to_wait = CP_SAMPLES;
+                        dpll_error_accumulator = 0.0f;
+                        printf("[DPLL Автоматика] !!! КОРРЕКЦИЯ: ТАКТ РАСШИРЕН ДО %u СЭМПЛОВ !!!\n", current_target_data_samples);
+                    }
+                    else {
+                        // Шагаем по стандартной сетке кадра
+                        current_target_data_samples = N_SAMPLES;
+                        samples_to_wait = CP_SAMPLES;
+                    }
+                } else {
+                    // Обработали первый ("гарпунный") символ
+                    printf("[DPSK Базис] 'Гарпунный' символ успешно захвачен и сохранен как фазовая опора кадра.\n");
+                    rx_phases_initialized = true;
+                    current_target_data_samples = N_SAMPLES;
+                    samples_to_wait = CP_SAMPLES;
+                }
+
+                // Проверка флага завершения передачи по маркеру EOT
+                if (rx_phases_initialized && decoded_nibble == 0x0F) {
+                    printf("[FSM Завершение] Получен маркер EOT. Поток остановлен.\n");
+                    rx_current_state = RX_STATE_SEARCH;
+                    rx_phases_initialized = false;
+                    return true;
+                }
+
+                // Шагаем на следующий символ потока через пропуск CP
+                guard_sample_cnt = 0;
+                rx_current_state = RX_STATE_GUARD;
+                return rx_phases_initialized; // Возвращаем true только для боевых букв
+                }
             break;
         }
     }
-
     return false;
 }
