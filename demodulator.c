@@ -1,4 +1,9 @@
 #include "demodulator.h"
+#include "complex_filter.h"
+
+// Кольцевые буферы выходов корреляторов для задержки на 1 символ (800 сэмплов)
+static complex_f corr_history[NUM_TONES][SYMBOL_LEN];
+static int history_idx = 0;
 
 void dsp_demodulator_init(demodulator_t *dem, float sample_rate, uint32_t symbol_len) {
     float frequencies[NUM_TONES] = {1300.0f, 1400.0f, 1500.0f, 1600.0f};
@@ -70,5 +75,73 @@ void dsp_demodulator_get_diff(demodulator_t *dem, const complex_f *current_outpu
 
     // Шагаем по кольцевому буферу задержки
     dem->delay_idx = (dem->delay_idx + 1) % dem->current_window_len;
+}
+
+void process_continuous_differential_tracking(const complex_f *current_corr, complex_f *output_diff) {
+    // 1. Извлекаем комплексные векторы пилот-тона (1300 Гц)
+    complex_f pilot_now  = current_corr[0];
+    complex_f pilot_past = corr_history[0][history_idx];
+
+    // 2. Вычисляем сырой дифференциальный вектор пилот-тона: R_pilot = pilot_now * conj(pilot_past)
+    complex_f r_pilot;
+    r_pilot.re = pilot_now.re * pilot_past.re + pilot_now.im * pilot_past.im;
+    r_pilot.im = pilot_now.im * pilot_past.re - pilot_now.re * pilot_past.im;
+
+    // КРИТИЧЕСКИЙ МОМЕНТ: Нормируем вектор пилота по амплитуде, чтобы он не искажал
+    // энергетический масштаб информационных каналов, но сохранял чистую фазу.
+    float pilot_mag_sq = r_pilot.re * r_pilot.re + r_pilot.im * r_pilot.im;
+
+    // Защита от деления на 0 при выключении передатчика (шумовая пыль)
+    float inv_pilot_mag = 1.0f;
+    if (pilot_mag_sq > 1e-7f) {
+        inv_pilot_mag = 1.0f / sqrtf(pilot_mag_sq);
+    }
+
+    // Нормированный сопряженный вектор пилота для «откручивания» частоты назад
+    complex_f pilot_compensation;
+    pilot_compensation.re = r_pilot.re * inv_pilot_mag;
+    pilot_compensation.im = -r_pilot.im * inv_pilot_mag; // Минус обеспечивает сопряжение (conj)
+
+    // 3. Компенсируем и докручиваем все каналы гребенки
+    for (int t = 0; t < NUM_TONES; t++) {
+        complex_f info_now  = current_corr[t];
+        complex_f info_past = corr_history[t][history_idx];
+
+        // Сырой дифференциальный шаг информационного тона
+        complex_f r_info;
+        r_info.re = info_now.re * info_past.re + info_now.im * info_past.im;
+        r_info.im = info_now.im * info_past.re - info_now.re * info_past.im;
+
+        float info_mag_sq = r_info.re * r_info.re + r_info.im * r_info.im;
+        float inv_info_mag = 1.0f;
+        if (info_mag_sq > 1e-7f) {
+            inv_info_mag = 1.0f / sqrtf(info_mag_sq);
+        }
+
+        // Извлекаем чистую, нормированную фазу информационного тона (длина вектора = 1.0)
+        complex_f r_info_norm;
+        r_info_norm.re = r_info.re * inv_info_mag;
+        r_info_norm.im = r_info.im * inv_info_mag;
+
+        complex_f rotated;
+        rotated.re = r_info_norm.re * pilot_compensation.re - r_info_norm.im * pilot_compensation.im;
+        rotated.im = r_info_norm.re * pilot_compensation.im + r_info_norm.im * pilot_compensation.re;
+
+        // Теперь возвращаем вектору ЛИНЕЙНУЮ текущую амплитуду текущего сэмпла.
+        // Это восстановит холмы энергии для Каскада 4 и Каскада 6 (АРУ), но уберет квадратичный разнос.
+        float current_amp = sqrtf(info_now.re * info_now.re + info_now.im * info_now.im);
+
+        output_diff[t].re = rotated.re * current_amp;
+        output_diff[t].im = rotated.im * current_amp;
+
+        // Сохраняем текущее значение в историю для следующего шага конвейера
+        corr_history[t][history_idx] = current_corr[t];
+    }
+
+    // Инкремент кольцевого индекса истории
+    history_idx++;
+    if (history_idx >= SYMBOL_LEN) {
+        history_idx = 0;
+    }
 }
 

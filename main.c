@@ -43,8 +43,8 @@ int main(void) {
     //fprintf(f_csv, "Sample,SumMag,StrobeMarker,DiffPhase1300\n");
 
     // Файл для сигнального созвездия
-    //FILE *f_const = fopen("constellation.csv", "w");
-    //fprintf(f_const, "Tone1300_I,Tone1300_Q,Tone1400_I,Tone1400_Q,Tone1500_I,Tone1500_Q,Tone1600_I,Tone1600_Q\n");
+    FILE *f_const = fopen("constellation.csv", "w");
+    fprintf(f_const, "Tone1300_I,Tone1300_Q,Tone1400_I,Tone1400_Q,Tone1500_I,Tone1500_Q,Tone1600_I,Tone1600_Q\n");
 
     // Генерируем массив случайных нибблов заранее
     //uint8_t tx_stream[TOTAL_SYMBOLS];
@@ -71,8 +71,8 @@ int main(void) {
             // Включаем постоянный дрейф +2.0 Гц строго перед шагом модулятора
             float test_freqs[NUM_TONES] = {1300.0f, 1400.0f, 1500.0f, 1600.0f};
             //float current_drift = 2.0f; // +2 Гц фиксированной расстройки
-            float current_drift = 3.0f * sinf(2.0f * M_PI_F * n / 3000.0f); // качающийся дрифт от -3.0 Гц до +3.0 Гц
-            //float current_drift = 0.0f;
+            //float current_drift = 3.0f * sinf(2.0f * M_PI_F * n / 3000.0f); // качающийся дрифт от -3.0 Гц до +3.0 Гц
+            float current_drift = 0.0f;
             for(int i = 0; i < NUM_TONES; i++) {
                 dsp_dds_set_frequency(&modulator.tone_gen[i], test_freqs[i] + current_drift, FS);
             }
@@ -81,7 +81,6 @@ int main(void) {
             dsp_modulator_step(&modulator, current_nibble, &tx_sample);
         }
 
-        /* === ВДАРИЛИ МОЩНЫМ ШУМОМ === */
         // Шум присутствует ВСЕГДА, даже в стартовой тишине, как в реальном радиоэфире!
         float noise_amplitude = 0.02f;
         float signal_scale = 0.98f;
@@ -100,7 +99,11 @@ int main(void) {
         dsp_demodulator_step(&demodulator, rx_filtered, demod_outputs);
 
         complex_f diff_outputs[NUM_TONES];
-        dsp_demodulator_get_diff(&demodulator, demod_outputs, diff_outputs);
+        //dsp_demodulator_get_diff(&demodulator, demod_outputs, diff_outputs);
+        process_continuous_differential_tracking (demod_outputs, diff_outputs);
+        //if (n % 100 == 0) { // Печатаем реже, чтобы не спамить в консоль
+        //    printf("[TEST_PILOT] Sample %d | Pilot Out: Re = %.4f, Im = %.4f\n", n, diff_outputs[0].re, diff_outputs[0].im);
+        //}
 
         // Считаем модули выходов корреляторов для синхронизатора
         float mags[NUM_TONES];
@@ -122,6 +125,11 @@ int main(void) {
         float dp1300 = atan2f(diff_outputs[0].im, diff_outputs[0].re) * 180.0f / M_PI_F;
 
         if (strobe) {
+        	fprintf (f_const, "%f,%f,%f,%f,%f,%f,%f,%f\n",
+					diff_outputs[0].re, diff_outputs[0].im,
+					diff_outputs[1].re, diff_outputs[1].im,
+					diff_outputs[2].re, diff_outputs[2].im,
+					diff_outputs[3].re, diff_outputs[3].im);
 #if 0
             int byte_ready = dsp_decoder_process_strobe(&decoder, diff_outputs);
 
@@ -164,7 +172,7 @@ int main(void) {
     }
 
     //fclose(f_csv);
-    //fclose(f_const);
+    fclose(f_const);
     wav_writer_close(&WaveDump);
     //printf("Тест завершен. Результаты в 'sync_test.csv'\n");
     return 0;

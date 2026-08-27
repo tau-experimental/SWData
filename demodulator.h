@@ -6,7 +6,8 @@
 #include "dds.h"
 #include "complex_filter.h"
 
-
+#define FS 8000.0f
+#define SYMBOL_LEN 800
 #define MAX_SYMBOL_LEN 1000
 
 typedef struct {
@@ -28,5 +29,7 @@ void dsp_demodulator_step(demodulator_t *dem, const complex_f *rx_filtered_input
 
 /* Новая функция: вычисляет дифференциальный комплексный вектор для каждого тона */
 void dsp_demodulator_get_diff(demodulator_t *dem, const complex_f *current_outputs, complex_f *diff_outputs);
+// непрерывный докручиватель
+void process_continuous_differential_tracking(const complex_f *current_corr, complex_f *output_diff);
 
 #endif /* DEMODULATOR_H */
