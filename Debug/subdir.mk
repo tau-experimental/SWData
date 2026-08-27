@@ -4,21 +4,36 @@
 
 # Add inputs and outputs from these tool invocations to the build variables 
 C_SRCS += \
+../complex_filter.c \
+../dds.c \
+../decoder.c \
+../demodulator.c \
+../filter.c \
 ../main.c \
-../rx.c \
-../tx.c \
+../modulator.c \
+../sync.c \
 ../wav_io.c 
 
 C_DEPS += \
+./complex_filter.d \
+./dds.d \
+./decoder.d \
+./demodulator.d \
+./filter.d \
 ./main.d \
-./rx.d \
-./tx.d \
+./modulator.d \
+./sync.d \
 ./wav_io.d 
 
 OBJS += \
+./complex_filter.o \
+./dds.o \
+./decoder.o \
+./demodulator.o \
+./filter.o \
 ./main.o \
-./rx.o \
-./tx.o \
+./modulator.o \
+./sync.o \
 ./wav_io.o 
 
 
@@ -34,7 +49,7 @@ OBJS += \
 clean: clean--2e-
 
 clean--2e-:
-	-$(RM) ./main.d ./main.o ./rx.d ./rx.o ./tx.d ./tx.o ./wav_io.d ./wav_io.o
+	-$(RM) ./complex_filter.d ./complex_filter.o ./dds.d ./dds.o ./decoder.d ./decoder.o ./demodulator.d ./demodulator.o ./filter.d ./filter.o ./main.d ./main.o ./modulator.d ./modulator.o ./sync.d ./sync.o ./wav_io.d ./wav_io.o
 
 .PHONY: clean--2e-
 

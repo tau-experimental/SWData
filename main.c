@@ -1,112 +1,171 @@
 #include <stdio.h>
-#include <stdlib.h>
 #include <math.h>
-#include <stdbool.h>
-
-#include "config.h"
-#include "tx.h"
-#include "rx.h"
+#include <stdlib.h>
+#include "dsp_utils.h"
+#include "modulator.h"
+#include "complex_filter.h"
+#include "demodulator.h"
+#include "decoder.h"
+#include "sync.h"
 #include "wav_io.h"
 
-// Внешние функции конвейера из rx.c
-extern void rx_pipeline_init(void);
-extern void stage2_bpf_filter(int tone_idx, const complex_f *input);
+#define FS 8000.0f
+#define SYMBOL_LEN 800
+#define RANDOM_SILENCE_LEN 650
+#define TOTAL_SYMBOLS 100
+#define TOTAL_SAMPLES (RANDOM_SILENCE_LEN + SYMBOL_LEN * TOTAL_SYMBOLS)+1000
 
+int main(void) {
+	wav_writer_t WaveDump;
+    dsp_dds_init_table();
 
+    wav_writer_open(&WaveDump, "SyncNoise.wav", 8000);
 
-// Генератор белого шума (Бокс-Мюллер)
-static float get_noise(float sigma) {
-    if (sigma <= 0.0f) return 0.0f;
-    float u1 = (float)rand() / (float)RAND_MAX;
-    float u2 = (float)rand() / (float)RAND_MAX;
-    if (u1 < 1e-9f) u1 = 1e-9f;
-    return sigma * sqrtf(-2.0f * logf(u1)) * cosf(2.0f * PI_F * u2);
-}
+    modulator_t modulator;
+    dsp_modulator_init(&modulator, FS, SYMBOL_LEN);
 
-void run_bpf_test_scenario(const char* name, float test_freq, float noise_level, const char* out_wave_pfx) {
-    printf("\n--- Запуск подкаста: %s (Сигнал: %.1f Гц, Шум: %.2f) ---\n", name, test_freq, noise_level);
+    complex_filter_bank_t filter_bank;
+    dsp_complex_bank_init(&filter_bank, FS, 100.0f);
 
-    rx_pipeline_init(); // Сброс всех фильтров перед тестом
+    demodulator_t demodulator;
+    dsp_demodulator_init(&demodulator, FS, SYMBOL_LEN);
 
-    // Открываем WAV-файлы для записи результатов
-    char fn_in[128], fn_f1[128], fn_f2[128];
-    sprintf(fn_in, "%s_input.wav", out_wave_pfx);
-    sprintf(fn_f1, "%s_output_bpf1000.wav", out_wave_pfx);
-    sprintf(fn_f2, "%s_output_bpf1200.wav", out_wave_pfx);
+    clock_recovery_t sync;
+    dsp_sync_init(&sync, SYMBOL_LEN);
 
-    FILE* f_in = wav_open_write(fn_in, (uint32_t)FS);
-    FILE* f_f1 = wav_open_write(fn_f1, (uint32_t)FS);
-    FILE* f_f2 = wav_open_write(fn_f2, (uint32_t)FS);
+    dsp_ema_filter_t sum_mag_filter;
+    dsp_ema_init(&sum_mag_filter, 0.10f); // 10% нового сигнала, 90% истории
 
-    float tx_phase = 0.0f;
-    const int test_len = 12000; // 1.5 секунды записи для Audacity
-    printf ("Начало прогона: tx_phase: %+2.2f, test_freq = %4.1f, noise level = %2.2f\n", tx_phase, test_freq, noise_level);
+    dsp_decoder_t decoder;
+    dsp_decoder_init(&decoder);
 
-    for (int n = 0; n < test_len; n++) {
-        complex_f tx_signal = {0.0f, 0.0f};
+    //FILE *f_csv = fopen("sync_test.csv", "w");
+    //fprintf(f_csv, "Sample,SumMag,StrobeMarker,DiffPhase1300\n");
 
-        // Генерируем тестовый тон, если частота > 0
-        if (test_freq > 0.0f) {
-            tx_phase += 2.0f * PI_F * test_freq / FS;
-            if (tx_phase > PI_F) tx_phase -= 2.0f * PI_F;
-            tx_signal.re = cosf(tx_phase);
-            tx_signal.im = sinf(tx_phase);
+    // Файл для сигнального созвездия
+    //FILE *f_const = fopen("constellation.csv", "w");
+    //fprintf(f_const, "Tone1300_I,Tone1300_Q,Tone1400_I,Tone1400_Q,Tone1500_I,Tone1500_Q,Tone1600_I,Tone1600_Q\n");
+
+    // Генерируем массив случайных нибблов заранее
+    //uint8_t tx_stream[TOTAL_SYMBOLS];
+    //tx_stream[0] = 0x0; tx_stream[1] = 0x0; tx_stream[2] = 0x0; // Преамбула тишины
+    //for(int i = 3; i < TOTAL_SYMBOLS; i++) { tx_stream[i] = rand() % 16; }; // Случайный ниббл от 0x0 до 0xF
+    int current_symbol_idx = 0;
+    // Тестовая последовательность для байта 0x73, затем 0xA5
+    uint8_t tx_stream[] = {0x0, 0x0, 0x0, 0x0A, 0x7, 0x3, 0xA, 0x5, 0xB, 0xE, 0x0, 0x0};
+    //uint8_t tx_stream[] = {0x0, 0x0, 0x0, 0x0A, 0x7, 0x3, 0xD, 0x5, 0xB, 0xE, 0x0, 0x0};
+    uint32_t total_symbols = 12;
+	uint32_t total_samples = RANDOM_SILENCE_LEN + SYMBOL_LEN * total_symbols + 2000;
+
+    printf("Сбор данных для сигнального созвездия под шумом...\n");
+
+    for (int n = 0; n < total_samples; n++) { // был макрос TOTAL_SAMPLES
+        complex_f tx_sample = {0.0f, 0.0f};
+
+        // Симулируем стартовую и завершающую тишину
+        if ((n >= RANDOM_SILENCE_LEN) && (current_symbol_idx < sizeof(tx_stream))) {
+        	current_symbol_idx = (n - RANDOM_SILENCE_LEN) / SYMBOL_LEN;
+            uint8_t current_nibble = tx_stream[current_symbol_idx];
+
+            /* === КВ-ДРЕЙФ ЧАСТОТЫ ПЕРЕДАТЧИКА === */
+            // Включаем постоянный дрейф +2.0 Гц строго перед шагом модулятора
+            float test_freqs[NUM_TONES] = {1300.0f, 1400.0f, 1500.0f, 1600.0f};
+            //float current_drift = 2.0f; // +2 Гц фиксированной расстройки
+            float current_drift = 3.0f * sinf(2.0f * M_PI_F * n / 3000.0f); // качающийся дрифт от -3.0 Гц до +3.0 Гц
+            //float current_drift = 0.0f;
+            for(int i = 0; i < NUM_TONES; i++) {
+                dsp_dds_set_frequency(&modulator.tone_gen[i], test_freqs[i] + current_drift, FS);
+            }
+            /* =================================== */
+
+            dsp_modulator_step(&modulator, current_nibble, &tx_sample);
         }
 
-        // Добавляем шум, если задан
-        tx_signal.re += get_noise(noise_level);
-        tx_signal.im += get_noise(noise_level);
+        /* === ВДАРИЛИ МОЩНЫМ ШУМОМ === */
+        // Шум присутствует ВСЕГДА, даже в стартовой тишине, как в реальном радиоэфире!
+        float noise_amplitude = 0.02f;
+        float signal_scale = 0.98f;
 
-        // Записываем то, что летит на вход фильтрам
-        wav_write_sample(f_in, tx_signal.re, tx_signal.im);
+        tx_sample.re = tx_sample.re * signal_scale + generate_white_noise() * noise_amplitude;
+        tx_sample.im = tx_sample.im * signal_scale + generate_white_noise() * noise_amplitude;
 
-        // Пропускаем СТАТИЧЕСКИЙ сигнал через независимые фильтры (БЕЗ АПЧ!)
-        for (int t = 0; t < NUM_DATA_TONES; t++) {
-            stage2_bpf_filter(t, &tx_signal);
+        wav_writer_write_sample(&WaveDump, tx_sample.re, tx_sample.im);
+
+        // Приемный тракт
+        complex_f rx_filtered[NUM_TONES];
+        dsp_complex_bank_process(&filter_bank, tx_sample, rx_filtered);
+
+        complex_f demod_outputs[NUM_TONES];
+        dsp_complex_bank_process(&filter_bank, tx_sample, rx_filtered); // Дубликат убираем, вызываем демод:
+        dsp_demodulator_step(&demodulator, rx_filtered, demod_outputs);
+
+        complex_f diff_outputs[NUM_TONES];
+        dsp_demodulator_get_diff(&demodulator, demod_outputs, diff_outputs);
+
+        // Считаем модули выходов корреляторов для синхронизатора
+        float mags[NUM_TONES];
+        float raw_sum_mag = 0.0f;
+        for(int i = 0; i < NUM_TONES; i++) {
+            mags[i] = sqrtf(c_mag2(demod_outputs[i]));
+            raw_sum_mag += mags[i];
         }
 
-        // оцениваем частотный сдвиг
-        stage3_frequency_assessment();
+        /* === НОВЫЙ КАСКАД КОНВЕЙЕРА: СГЛАЖИВАНИЕ === */
+        float smoothed_sum_mag = dsp_ema_process(&sum_mag_filter, raw_sum_mag);
 
-        // Записываем выходы фильтра 1000 Гц и фильтра 1200 Гц
-        wav_write_sample(f_f1, rx_bpf_bank[0].y_curr.re, rx_bpf_bank[0].y_curr.im);
-        wav_write_sample(f_f2, rx_bpf_bank[1].y_curr.re, rx_bpf_bank[1].y_curr.im);
 
-        // Короткий лог в консоль для визуального контроля амплитуд
-        if (n == 200 || (n % 1000)==0) {
-            float amp0 = sqrtf(rx_bpf_bank[0].y_curr.re*rx_bpf_bank[0].y_curr.re + rx_bpf_bank[0].y_curr.im*rx_bpf_bank[0].y_curr.im);
-            float amp1 = sqrtf(rx_bpf_bank[1].y_curr.re*rx_bpf_bank[1].y_curr.re + rx_bpf_bank[1].y_curr.im*rx_bpf_bank[1].y_curr.im);
-            float amp2 = sqrtf(rx_bpf_bank[2].y_curr.re*rx_bpf_bank[2].y_curr.re + rx_bpf_bank[2].y_curr.im*rx_bpf_bank[2].y_curr.im);
-            float amp3 = sqrtf(rx_bpf_bank[3].y_curr.re*rx_bpf_bank[3].y_curr.re + rx_bpf_bank[3].y_curr.im*rx_bpf_bank[3].y_curr.im);
-            printf("  [Сэмпл %04d] Амплитуда на выходах BPF: (%6.3f, %6.3f, %6.3f, %6.3f)\n",
-            		n, amp0, amp1, amp2, amp3);
+        // Шаг автомата синхронизации
+        //float sum_mag = 0.0f;
+        bool strobe = dsp_sync_step(&sync, smoothed_sum_mag);
 
-            printf("  Оценка частотных сдвигов: (%+3.3f, %+3.3f, %+3.3f. %+3.3f)\n",
-            		ch_cfo_estimates[0], ch_cfo_estimates[1], ch_cfo_estimates[2], ch_cfo_estimates[3]);
-            printf("  smooth_cfo: %+4.2f Hz\n", debug_smooth_cfo_hz );
+        // Фаза для контроля
+        float dp1300 = atan2f(diff_outputs[0].im, diff_outputs[0].re) * 180.0f / M_PI_F;
+
+        if (strobe) {
+#if 0
+            int byte_ready = dsp_decoder_process_strobe(&decoder, diff_outputs);
+
+            // Записываем в лог принятый ниббл
+            if (n > (RANDOM_SILENCE_LEN + SYMBOL_LEN * 2)) {
+                printf("[DECODER] Строб на сэмпле %d. Распознан ниббл: 0x%X\n", n, decoder.current_nibble);
+
+                if (byte_ready) {
+                    printf("[DECODER] >>> ПРИНЯТ ПОЛНЫЙ БАЙТ: 0x%02X <<<\n", decoder.received_byte);
+                }
+            }
+#else
+            /* === ВРЕМЕННЫЙ ЖЕСТКИЙ СИНХРОМАРКЕР ДЛЯ ТЕСТА ГЕОМЕТРИИ ===
+               Передатчик излучает:
+               Символ 0 (сэмплы 650-1450): 0x0
+               Символ 1 (сэмплы 1450-2250): 0x0
+               Символ 2 (сэмплы 2250-3050): 0x0
+               Символ 3 (сэмплы 3050-3850): 0x0A (Наш маркер кадра!)
+               Значит, строб на отметке ~3850 зафиксирует конец маркера 0x0A.
+               Здесь мы жестко заставляем триггер встать в 0, чтобы СЛЕДУЮЩИЙ
+               символ (0x7) гарантированно считался как верхний ниббл! */
+            if (n >= 3800 && n <= 3900) {
+                decoder.nibble_toggle = 0;
+                printf("[DEBUG] Сетка нибблов жестко выровнена на сэмпле %d\n", n);
+            }
+            /* ========================================================== */
+
+            int byte_ready = dsp_decoder_process_strobe(&decoder, diff_outputs);
+
+            // Выводим логи только для полезных данных (после маркера)
+            if (n > 3900) {
+                printf("[DECODER] Строб на сэмпле %d. Распознан ниббл: 0x%X\n", n, decoder.current_nibble);
+
+                if (byte_ready) {
+                    printf("[DECODER] >>> ПРИНЯТ ПОЛНЫЙ БАЙТ: 0x%02X <<<\n", decoder.received_byte);
+                }
+            }
+#endif
         }
     }
 
-    wav_close(f_in);
-    wav_close(f_f1);
-    wav_close(f_f2);
-    printf("  Экспорт в файлы завершен успешно.\n");
-}
-
-int main(void) {
-	float shift = -32.0;
-    // Сценарий А: Чистый тон 1000 Гц (Должен ожить только BPF-1000)
-    run_bpf_test_scenario("Чистый тон 1000 Гц + сдвиг", 1000.0f + shift, 0.0f, "test_tone1000");
-
-    // Сценарий Б: Чистый тон 1200 Гц (Должен ожить только BPF-1200)
-    run_bpf_test_scenario("Чистый тон 1200 Гц + сдвиг", 1200.0f + shift, 0.0f, "test_tone1200");
-    run_bpf_test_scenario("Чистый тон 1400 Гц + сдвиг", 1400.0f + shift, 0.0f, "test_tone1400");
-    shift = 25.0;
-    run_bpf_test_scenario("Чистый тон 1600 Гц + сдвиг", 1600.0f + shift, 0.0f, "test_tone1600");
-
-    shift = 0.0;
-    // Сценарий В: Экстремальный белый шум без полезного сигнала
-    run_bpf_test_scenario("Чистый белый шум", 0.0f, 0.5f, "test_pure_noise");
-
+    //fclose(f_csv);
+    //fclose(f_const);
+    wav_writer_close(&WaveDump);
+    //printf("Тест завершен. Результаты в 'sync_test.csv'\n");
     return 0;
 }
