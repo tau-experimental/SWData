@@ -7,8 +7,6 @@
 
 typedef struct {
     uint8_t current_nibble;      // Текущий декодированный ниббл (4 бита)
-    uint8_t received_byte;       // Собранный из двух нибблов байт
-    int nibble_toggle;           // Триггер: 0 - ждем верхний ниббл, 1 - ждем нижний
 } dsp_decoder_t;
 
 void dsp_decoder_init(dsp_decoder_t *dec);

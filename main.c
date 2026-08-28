@@ -25,10 +25,11 @@ int main(void) {
     dsp_modulator_init(&modulator, FS, SYMBOL_LEN);
 
     complex_filter_bank_t filter_bank;
-    dsp_complex_bank_init(&filter_bank, FS, 100.0f);
+    dsp_complex_bank_init(&filter_bank, FS, 90.0f);
 
     demodulator_t demodulator;
     dsp_demodulator_init(&demodulator, FS, SYMBOL_LEN);
+    dsp_demodulator_reset_all_history();
 
     clock_recovery_t sync;
     dsp_sync_init(&sync, SYMBOL_LEN);
@@ -59,6 +60,8 @@ int main(void) {
 
     printf("Сбор данных для сигнального созвездия под шумом...\n");
 
+
+
     for (int n = 0; n < total_samples; n++) { // был макрос TOTAL_SAMPLES
         complex_f tx_sample = {0.0f, 0.0f};
 
@@ -69,21 +72,23 @@ int main(void) {
 
             /* === КВ-ДРЕЙФ ЧАСТОТЫ ПЕРЕДАТЧИКА === */
             // Включаем постоянный дрейф +2.0 Гц строго перед шагом модулятора
+#if 1
             float test_freqs[NUM_TONES] = {1300.0f, 1400.0f, 1500.0f, 1600.0f};
-            //float current_drift = 2.0f; // +2 Гц фиксированной расстройки
+            //float current_drift = -2.0f; // +-2 Гц фиксированной расстройки
             //float current_drift = 3.0f * sinf(2.0f * M_PI_F * n / 3000.0f); // качающийся дрифт от -3.0 Гц до +3.0 Гц
             float current_drift = 0.0f;
             for(int i = 0; i < NUM_TONES; i++) {
                 dsp_dds_set_frequency(&modulator.tone_gen[i], test_freqs[i] + current_drift, FS);
             }
+#endif
             /* =================================== */
 
             dsp_modulator_step(&modulator, current_nibble, &tx_sample);
         }
 
         // Шум присутствует ВСЕГДА, даже в стартовой тишине, как в реальном радиоэфире!
-        float noise_amplitude = 0.02f;
-        float signal_scale = 0.98f;
+        float noise_amplitude = 0.015f;
+        float signal_scale = (1.0f - noise_amplitude);
 
         tx_sample.re = tx_sample.re * signal_scale + generate_white_noise() * noise_amplitude;
         tx_sample.im = tx_sample.im * signal_scale + generate_white_noise() * noise_amplitude;
@@ -92,25 +97,31 @@ int main(void) {
 
         // Приемный тракт
         complex_f rx_filtered[NUM_TONES];
-        dsp_complex_bank_process(&filter_bank, tx_sample, rx_filtered);
-
         complex_f demod_outputs[NUM_TONES];
-        dsp_complex_bank_process(&filter_bank, tx_sample, rx_filtered); // Дубликат убираем, вызываем демод:
+        dsp_complex_bank_process(&filter_bank, tx_sample, rx_filtered);
         dsp_demodulator_step(&demodulator, rx_filtered, demod_outputs);
 
-        complex_f diff_outputs[NUM_TONES];
-        //dsp_demodulator_get_diff(&demodulator, demod_outputs, diff_outputs);
-        process_continuous_differential_tracking (demod_outputs, diff_outputs);
-        //if (n % 100 == 0) { // Печатаем реже, чтобы не спамить в консоль
-        //    printf("[TEST_PILOT] Sample %d | Pilot Out: Re = %.4f, Im = %.4f\n", n, diff_outputs[0].re, diff_outputs[0].im);
-        //}
+        /* компенсация дрейфа */
+        complex_f frozen[NUM_TONES], output_diff[NUM_TONES];
+        //dsp_demodulator_get_diff (&demodulator, demod_outputs, output_diff);
+        //dsp_demodulator_freeze_drift (&demodulator, demod_outputs, frozen);
+        dsp_demodulator_continuous_freeze (demod_outputs, frozen);
+
+    	/*fprintf (f_const, "%f,%f,%f,%f,%f,%f,%f,%f\n",
+    			frozen[0].re, frozen[0].im,
+				frozen[1].re, frozen[1].im,
+				frozen[2].re, frozen[2].im,
+				frozen[3].re, frozen[3].im);*/
 
         // Считаем модули выходов корреляторов для синхронизатора
         float mags[NUM_TONES];
         float raw_sum_mag = 0.0f;
         for(int i = 0; i < NUM_TONES; i++) {
-            mags[i] = sqrtf(c_mag2(demod_outputs[i]));
+            mags[i] = sqrtf(c_mag2(frozen[i]));
             raw_sum_mag += mags[i];
+            /*if ((n % 100)==0) { printf ("Sample %d Energy of frozen phases: %+3.2f, %+3.2f, %+3.2f, %+3.2f\n",
+            		n, mags[0], mags[1], mags[2], mags[3]);
+            }*/
         }
 
         /* === НОВЫЙ КАСКАД КОНВЕЙЕРА: СГЛАЖИВАНИЕ === */
@@ -121,53 +132,45 @@ int main(void) {
         //float sum_mag = 0.0f;
         bool strobe = dsp_sync_step(&sync, smoothed_sum_mag);
 
-        // Фаза для контроля
-        float dp1300 = atan2f(diff_outputs[0].im, diff_outputs[0].re) * 180.0f / M_PI_F;
+        //////
 
         if (strobe) {
-        	fprintf (f_const, "%f,%f,%f,%f,%f,%f,%f,%f\n",
-					diff_outputs[0].re, diff_outputs[0].im,
-					diff_outputs[1].re, diff_outputs[1].im,
-					diff_outputs[2].re, diff_outputs[2].im,
-					diff_outputs[3].re, diff_outputs[3].im);
+        	//dsp_demodulator_strobe_diff(&demodulator, frozen, output_diff);
+        	complex_f diff_outputs[NUM_TONES];
 #if 0
-            int byte_ready = dsp_decoder_process_strobe(&decoder, diff_outputs);
+            int byte_ready = dsp_decoder_process_strobe(&decoder, output_diff);
 
             // Записываем в лог принятый ниббл
-            if (n > (RANDOM_SILENCE_LEN + SYMBOL_LEN * 2)) {
+            //if (n > (RANDOM_SILENCE_LEN + SYMBOL_LEN * 2)) {
+            if (byte_ready)
+            {
                 printf("[DECODER] Строб на сэмпле %d. Распознан ниббл: 0x%X\n", n, decoder.current_nibble);
 
-                if (byte_ready) {
-                    printf("[DECODER] >>> ПРИНЯТ ПОЛНЫЙ БАЙТ: 0x%02X <<<\n", decoder.received_byte);
-                }
             }
 #else
-            /* === ВРЕМЕННЫЙ ЖЕСТКИЙ СИНХРОМАРКЕР ДЛЯ ТЕСТА ГЕОМЕТРИИ ===
-               Передатчик излучает:
-               Символ 0 (сэмплы 650-1450): 0x0
-               Символ 1 (сэмплы 1450-2250): 0x0
-               Символ 2 (сэмплы 2250-3050): 0x0
-               Символ 3 (сэмплы 3050-3850): 0x0A (Наш маркер кадра!)
-               Значит, строб на отметке ~3850 зафиксирует конец маркера 0x0A.
-               Здесь мы жестко заставляем триггер встать в 0, чтобы СЛЕДУЮЩИЙ
-               символ (0x7) гарантированно считался как верхний ниббл! */
-            if (n >= 3800 && n <= 3900) {
-                decoder.nibble_toggle = 0;
-                printf("[DEBUG] Сетка нибблов жестко выровнена на сэмпле %d\n", n);
-            }
-            /* ========================================================== */
+            // Легализуем джиттер синхронизатора через слепки макушек
+            dsp_demodulator_strobe_latch(frozen, diff_outputs);
 
-            int byte_ready = dsp_decoder_process_strobe(&decoder, diff_outputs);
+            // Передаем в декодер
+            uint8_t nibble = dsp_decoder_process_strobe(&decoder, diff_outputs);
+            //printf("[DECODER] Строб на сэмпле %d. Декодирован ниббл: 0x%X\n", n, decoder.current_nibble);
 
-            // Выводим логи только для полезных данных (после маркера)
-            if (n > 3900) {
-                printf("[DECODER] Строб на сэмпле %d. Распознан ниббл: 0x%X\n", n, decoder.current_nibble);
-
-                if (byte_ready) {
-                    printf("[DECODER] >>> ПРИНЯТ ПОЛНЫЙ БАЙТ: 0x%02X <<<\n", decoder.received_byte);
-                }
-            }
+            // Вывод созвездия в gnuplot (теперь пишем в файл строго по стробу)
+            //log_strobe_constellation_to_csv(diff_outputs);
 #endif
+
+        	/*fprintf (f_const, "%f,%f,%f,%f,%f,%f,%f,%f\n",
+        			diff_outputs[0].re, diff_outputs[0].im,
+					diff_outputs[1].re, diff_outputs[1].im,
+					diff_outputs[2].re, diff_outputs[2].im,
+					diff_outputs[3].re, diff_outputs[3].im);*/
+        	fprintf (f_const, "%f,%f,%f,%f,%f,%f,%f,%f\n",
+        			frozen[0].re, frozen[0].im,
+    				frozen[1].re, frozen[1].im,
+    				frozen[2].re, frozen[2].im,
+    				frozen[3].re, frozen[3].im);
+
+
         }
     }
 

@@ -3,8 +3,6 @@
 
 void dsp_decoder_init(dsp_decoder_t *dec) {
     dec->current_nibble = 0;
-    dec->received_byte = 0;
-    dec->nibble_toggle = 0;
 }
 
 /* Вспомогательная нормализация угла в диапазон [-PI, PI] */
@@ -34,7 +32,9 @@ int dsp_decoder_process_strobe(dsp_decoder_t *dec, const complex_f *diff_outputs
     uint8_t nibble = 0;
     for (int i = 0; i < NUM_TONES; i++) nibble |= (bits[i] << i);
     dec->current_nibble = nibble;
+    printf("0x%X\n", nibble);
 
+#if 0
     /* === БЛОК СИНХРОНИЗАЦИИ СЕТКИ НИББЛОВ === */
     if (!frame_synced) {
         // Мы ищем стартовый маркер. Пусть это будет ниббл 0xA.
@@ -49,6 +49,7 @@ int dsp_decoder_process_strobe(dsp_decoder_t *dec, const complex_f *diff_outputs
     /* ======================================= */
 
     // Обычная конвейерная сборка байта
+
     if (dec->nibble_toggle == 0) {
         dec->received_byte = (nibble << 4);
         dec->nibble_toggle = 1;
@@ -58,5 +59,7 @@ int dsp_decoder_process_strobe(dsp_decoder_t *dec, const complex_f *diff_outputs
         dec->nibble_toggle = 0;
         return 1;
     }
+#endif
+    return 1;
 }
 
