@@ -9,6 +9,7 @@ C_SRCS += \
 ../galois_field.c \
 ../interleaver.c \
 ../main.c \
+../puncturing.c \
 ../reed_solomon.c \
 ../scrambler.c \
 ../wav_io.c 
@@ -19,6 +20,7 @@ C_DEPS += \
 ./galois_field.d \
 ./interleaver.d \
 ./main.d \
+./puncturing.d \
 ./reed_solomon.d \
 ./scrambler.d \
 ./wav_io.d 
@@ -29,6 +31,7 @@ OBJS += \
 ./galois_field.o \
 ./interleaver.o \
 ./main.o \
+./puncturing.o \
 ./reed_solomon.o \
 ./scrambler.o \
 ./wav_io.o 
@@ -46,7 +49,7 @@ OBJS += \
 clean: clean--2e-
 
 clean--2e-:
-	-$(RM) ./complex_math.d ./complex_math.o ./conv_encoder.d ./conv_encoder.o ./galois_field.d ./galois_field.o ./interleaver.d ./interleaver.o ./main.d ./main.o ./reed_solomon.d ./reed_solomon.o ./scrambler.d ./scrambler.o ./wav_io.d ./wav_io.o
+	-$(RM) ./complex_math.d ./complex_math.o ./conv_encoder.d ./conv_encoder.o ./galois_field.d ./galois_field.o ./interleaver.d ./interleaver.o ./main.d ./main.o ./puncturing.d ./puncturing.o ./reed_solomon.d ./reed_solomon.o ./scrambler.d ./scrambler.o ./wav_io.d ./wav_io.o
 
 .PHONY: clean--2e-
 

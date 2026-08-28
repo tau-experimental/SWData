@@ -30,4 +30,7 @@ void conv_encode_block(conv_encoder_t *enc, const unsigned char *in_bytes, int i
 /* in_dibits: массив из 504 дибитов, принятых из канала */
 void viterbi_decode_block(unsigned char *out_bytes, const unsigned char *in_dibits);
 
+void viterbi_decode_soft_1_2(const unsigned char *in_soft_bits_1_2, unsigned char *out_bits);
+void conv_encode_pure_1_2(conv_encoder_t *enc, const unsigned char *in_bits, unsigned char *out_bits_1_2);
+
 #endif /* CONV_ENCODER_H */

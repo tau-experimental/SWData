@@ -1,2 +1,2 @@
-main.o: ../main.c ../conv_encoder.h
-../conv_encoder.h:
+main.o: ../main.c ../puncturing.h
+../puncturing.h:

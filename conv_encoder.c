@@ -35,44 +35,22 @@ static void viterbi_init_tables(void) {
     viterbi_inited = 1;
 }
 
-void conv_encode_block(conv_encoder_t *enc, const unsigned char *in_bytes, int in_len, unsigned char *out_dibits) {
-    int i, bit_idx;
-    int punct_cycle = 0;
-    int dibit_write_ptr = 0;
-    unsigned char current_dibit = 0;
-    int dibit_bit_cnt = 0;
+/* Чистый кодер Rate 1/2. На входе 840 бит, на выходе строго 1680 бит */
+void conv_encode_pure_1_2(conv_encoder_t *enc, const unsigned char *in_bits, unsigned char *out_bits_1_2) {
+    int i, j, write_ptr = 0;
+    for (i = 0; i < 840; i++) {
+        enc->reg = ((enc->reg << 1) | in_bits[i]) & 0x3F; /* 6 бит памяти */
 
-    for (i = 0; i < in_len; i++) {
-        unsigned char byte = in_bytes[i];
-        for (bit_idx = 7; bit_idx >= 0; bit_idx--) {
-            unsigned char input_bit = (byte >> bit_idx) & 1;
-            enc->reg = ((enc->reg << 1) | input_bit) & 0x7F;
+        /* Полный 7-битный регистр для полиномов */
+        unsigned char reg7 = (unsigned char)((enc->reg) | (in_bits[i] << 6));
 
-            unsigned char g1 = 0, g2 = 0;
-            int j;
-            for (j = 0; j < 7; j++) {
-                if ((POLY_G1 >> j) & 1) g1 ^= (enc->reg >> j) & 1;
-                if ((POLY_G2 >> j) & 1) g2 ^= (enc->reg >> j) & 1;
-            }
-
-            /* Вспомогательный макрос-лямбда для линейной упаковки бит в дибиты */
-            #define PACK_BIT(b) do { \
-                current_dibit = (current_dibit << 1) | (b); \
-                if (++dibit_bit_cnt == 2) { \
-                    out_dibits[dibit_write_ptr++] = current_dibit; \
-                    current_dibit = 0; dibit_bit_cnt = 0; \
-                } \
-            } while(0)
-
-            switch (punct_cycle) {
-                case 0: PACK_BIT(g1); PACK_BIT(g2); break;
-                case 1: PACK_BIT(g1); break;
-                case 2: PACK_BIT(g2); break;
-                case 3: PACK_BIT(g1); break;
-                case 4: PACK_BIT(g2); break;
-            }
-            if (++punct_cycle == 5) punct_cycle = 0;
+        unsigned char g1 = 0, g2 = 0;
+        for (j = 0; j < 7; j++) {
+            if ((POLY_G1 >> j) & 1) g1 ^= (reg7 >> j) & 1;
+            if ((POLY_G2 >> j) & 1) g2 ^= (reg7 >> j) & 1;
         }
+        out_bits_1_2[write_ptr++] = g1;
+        out_bits_1_2[write_ptr++] = g2;
     }
 }
 
@@ -101,26 +79,41 @@ void viterbi_decode_block(unsigned char *out_bytes, const unsigned char *in_dibi
         unsigned char r1 = 0, r2 = 0;
         unsigned char mask1 = 1, mask2 = 1;
 
-        int needed = (punct_cycle == 0) ? 2 : 1;
-        unsigned char got_bits[2] = {0, 0};
+        /* Шаг 0: Переданы оба бита (g1, затем g2) */
+        if (punct_cycle == 0) {
+            /* Читаем g1 */
+            if (dibit_bit_cnt == 0) { current_dibit = in_dibits[dibit_read_ptr++]; dibit_bit_cnt = 2; }
+            r1 = (current_dibit >> (dibit_bit_cnt - 1)) & 1; dibit_bit_cnt--;
 
-        for (i = 0; i < needed; i++) {
-            if (dibit_bit_cnt == 0) {
-                current_dibit = in_dibits[dibit_read_ptr++];
-                dibit_bit_cnt = 2;
-            }
-            /* Читаем строго от старшего бита дибита к младшему (Линейно!) */
-            got_bits[i] = (current_dibit >> (dibit_bit_cnt - 1)) & 1;
-            dibit_bit_cnt--;
+            /* Читаем g2 */
+            if (dibit_bit_cnt == 0) { current_dibit = in_dibits[dibit_read_ptr++]; dibit_bit_cnt = 2; }
+            r2 = (current_dibit >> (dibit_bit_cnt - 1)) & 1; dibit_bit_cnt--;
+        }
+        /* Шаг 1: Передан только g1 (g2 выколот) */
+        else if (punct_cycle == 1) {
+            if (dibit_bit_cnt == 0) { current_dibit = in_dibits[dibit_read_ptr++]; dibit_bit_cnt = 2; }
+            r1 = (current_dibit >> (dibit_bit_cnt - 1)) & 1; dibit_bit_cnt--;
+            mask2 = 0; /* Нейтральное значение для выколотого бита */
+        }
+        /* Шаг 2: Передан только g2 (g1 выколот) */
+        else if (punct_cycle == 2) {
+            if (dibit_bit_cnt == 0) { current_dibit = in_dibits[dibit_read_ptr++]; dibit_bit_cnt = 2; }
+            r2 = (current_dibit >> (dibit_bit_cnt - 1)) & 1; dibit_bit_cnt--;
+            mask1 = 0;
+        }
+        /* Шаг 3: Передан только g1 (g2 выколот) */
+        else if (punct_cycle == 3) {
+            if (dibit_bit_cnt == 0) { current_dibit = in_dibits[dibit_read_ptr++]; dibit_bit_cnt = 2; }
+            r1 = (current_dibit >> (dibit_bit_cnt - 1)) & 1; dibit_bit_cnt--;
+            mask2 = 0;
+        }
+        /* Шаг 4: Передан только g2 (g1 выколот) */
+        else if (punct_cycle == 4) {
+            if (dibit_bit_cnt == 0) { current_dibit = in_dibits[dibit_read_ptr++]; dibit_bit_cnt = 2; }
+            r2 = (current_dibit >> (dibit_bit_cnt - 1)) & 1; dibit_bit_cnt--;
+            mask1 = 0;
         }
 
-        switch (punct_cycle) {
-            case 0: r1 = got_bits[0]; r2 = got_bits[1]; break;
-            case 1: r1 = got_bits[0]; mask2 = 0; break;
-            case 2: r2 = got_bits[0]; mask1 = 0; break;
-            case 3: r1 = got_bits[0]; mask2 = 0; break;
-            case 4: r2 = got_bits[0]; mask1 = 0; break;
-        }
         punct_cycle = (punct_cycle + 1) % 5;
 
         for (i = 0; i < NUM_STATES; i++) next_metrics[i] = 999999;
@@ -191,3 +184,72 @@ void viterbi_decode_block(unsigned char *out_bytes, const unsigned char *in_dibi
         }
     }
 }
+
+/* Принимает 1680 мягких бит (где выколотые — это 127) и выдает 840 восстановленных бит */
+void viterbi_decode_soft_1_2(const unsigned char *in_soft_bits_1_2, unsigned char *out_bits) {
+    static unsigned int metrics[NUM_STATES];
+    static unsigned int next_metrics[NUM_STATES];
+    static unsigned char path_history[840][NUM_STATES];
+
+    int i, step, bit_idx;
+    viterbi_init_tables(); /* Таблицы next_state теперь генерируются строго под Rate 1/2 */
+
+    for (i = 0; i < NUM_STATES; i++) metrics[i] = 999999;
+    metrics[0] = 0;
+
+    int read_ptr = 0;
+    for (step = 0; step < 840; step++) {
+        /* Берем два мягких отсчета из эфира */
+        unsigned char soft_r1 = in_soft_bits_1_2[read_ptr++];
+        unsigned char soft_r2 = in_soft_bits_1_2[read_ptr++];
+
+        for (i = 0; i < NUM_STATES; i++) next_metrics[i] = 999999;
+
+        for (i = 0; i < NUM_STATES; i++) {
+            if (metrics[i] > 900000) continue;
+
+            for (bit_idx = 0; bit_idx < 2; bit_idx++) {
+                int next = next_state[i][bit_idx];
+                unsigned char** out_bits_p = (unsigned char**)out_bits;
+                unsigned char out = out_bits_p[i][bit_idx];
+
+                /* Идеальные целевые значения для этого перехода: 0 или 255 */
+                unsigned char target_o1 = ((out >> 1) & 1) ? 255 : 0;
+                unsigned char target_o2 = (out & 1) ? 255 : 0;
+
+                /* Мягкая метрика — Евклидово расстояние (abs разность) */
+                unsigned int dist = 0;
+                dist += (unsigned int)(char)abs(soft_r1 - target_o1);
+                dist += (unsigned int)(char)abs(soft_r2 - target_o2);
+
+                unsigned int new_metric = metrics[i] + dist;
+                if (new_metric < next_metrics[next]) {
+                    next_metrics[next] = new_metric;
+                    path_history[step][next] = (unsigned char)bit_idx; /* Сохраняем выживший информационный бит! */
+                }
+            }
+        }
+        memcpy(metrics, next_metrics, sizeof(metrics));
+    }
+
+    /* TRACEBACK (Обратный ход по решетке) */
+    int curr_state = 0;
+    unsigned int min_metric = 999999;
+    for (i = 0; i < NUM_STATES; i++) {
+        if (metrics[i] < min_metric) { min_metric = metrics[i]; curr_state = i; }
+    }
+
+    for (step = 839; step >= 0; step--) {
+        unsigned char bit = path_history[step][curr_state];
+        out_bits[step] = bit;
+
+        /* Восстановление предка для Rate 1/2 через наш канонический сдвиг */
+        /* Поиск предка */
+        int prev_state = 0;
+        for (i = 0; i < NUM_STATES; i++) {
+            if (next_state[i][bit] == curr_state) { prev_state = i; break; }
+        }
+        curr_state = prev_state;
+    }
+}
+
