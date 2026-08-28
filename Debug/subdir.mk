@@ -4,36 +4,33 @@
 
 # Add inputs and outputs from these tool invocations to the build variables 
 C_SRCS += \
-../complex_filter.c \
-../dds.c \
-../decoder.c \
-../demodulator.c \
-../filter.c \
+../complex_math.c \
+../conv_encoder.c \
+../galois_field.c \
+../interleaver.c \
 ../main.c \
-../modulator.c \
-../sync.c \
+../reed_solomon.c \
+../scrambler.c \
 ../wav_io.c 
 
 C_DEPS += \
-./complex_filter.d \
-./dds.d \
-./decoder.d \
-./demodulator.d \
-./filter.d \
+./complex_math.d \
+./conv_encoder.d \
+./galois_field.d \
+./interleaver.d \
 ./main.d \
-./modulator.d \
-./sync.d \
+./reed_solomon.d \
+./scrambler.d \
 ./wav_io.d 
 
 OBJS += \
-./complex_filter.o \
-./dds.o \
-./decoder.o \
-./demodulator.o \
-./filter.o \
+./complex_math.o \
+./conv_encoder.o \
+./galois_field.o \
+./interleaver.o \
 ./main.o \
-./modulator.o \
-./sync.o \
+./reed_solomon.o \
+./scrambler.o \
 ./wav_io.o 
 
 
@@ -49,7 +46,7 @@ OBJS += \
 clean: clean--2e-
 
 clean--2e-:
-	-$(RM) ./complex_filter.d ./complex_filter.o ./dds.d ./dds.o ./decoder.d ./decoder.o ./demodulator.d ./demodulator.o ./filter.d ./filter.o ./main.d ./main.o ./modulator.d ./modulator.o ./sync.d ./sync.o ./wav_io.d ./wav_io.o
+	-$(RM) ./complex_math.d ./complex_math.o ./conv_encoder.d ./conv_encoder.o ./galois_field.d ./galois_field.o ./interleaver.d ./interleaver.o ./main.d ./main.o ./reed_solomon.d ./reed_solomon.o ./scrambler.d ./scrambler.o ./wav_io.d ./wav_io.o
 
 .PHONY: clean--2e-
 
