@@ -7,6 +7,8 @@
 
 #define NUM_STATES 64 /* размер ершётки для Витерби */
 
+extern unsigned char out_bits[NUM_STATES][2];
+
 /* Структура состояния сверточного кодера */
 typedef struct {
     unsigned char reg; /* 7-битный сдвиговый регистр памяти кодера */
@@ -32,5 +34,8 @@ void viterbi_decode_block(unsigned char *out_bytes, const unsigned char *in_dibi
 
 void viterbi_decode_soft_1_2(const unsigned char *in_soft_bits_1_2, unsigned char *out_bits);
 void conv_encode_pure_1_2(conv_encoder_t *enc, const unsigned char *in_bits, unsigned char *out_bits_1_2);
+
+void viterbi_init_tables(void);
+void viterbi_debug (const unsigned char * tx_payload_bits, const unsigned char *in_soft_bits_1_2, unsigned char *out_bytes_p);
 
 #endif /* CONV_ENCODER_H */
