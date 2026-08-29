@@ -109,7 +109,7 @@ void fft_light_fixed256(const int16_t *in_i, const int16_t *in_q, uint32_t *out_
     // To prevent fixed-point addition overflow during butterfly stages,
     // we pre-scale input samples down by shifting right by 4 bits (div by 16)
     for (int i = 0; i < 256; i++) {
-        int8_t rev_idx = bit_reverse_256[i];
+        uint8_t rev_idx = bit_reverse_256[i];
 
         // Fixed point fractional multiplication: (A * B) >> 15
         int32_t i_win = ((int32_t)in_i[i] * mcu_hamming_q15[i]) >> 15;
@@ -158,3 +158,154 @@ void fft_light_fixed256(const int16_t *in_i, const int16_t *in_q, uint32_t *out_
         out_sq_magnitude[i] = (uint32_t)(r*r + j*j);
     }
 }
+
+// Возвращает расстройку в Гц, если пилот найден, или -999.0f, если в эфире только шум
+// Сканирует целочисленный спектр.
+float check_mcu_spectrum_for_pilot(const uint32_t *out_sq_magnitude) {
+    int max_bin = -1;
+    uint64_t max_sq_amp = 0;
+    uint64_t noise_sq_sum = 0;
+    int noise_count = 0;
+
+    // 1. Сканируем спектр (до частоты Найквиста - 128 бин)
+    for (int bin = 0; bin < 128; bin++) {
+        if (bin >= 29 && bin <= 35) {
+            if (out_sq_magnitude[bin] > max_sq_amp) {
+                max_sq_amp = out_sq_magnitude[bin];
+                max_bin = bin;
+            }
+        } else {
+            // Суммируем квадраты энергий шумовых бинов
+            noise_sq_sum += out_sq_magnitude[bin];
+            noise_count++;
+        }
+    }
+
+    if (max_bin == -1 || noise_count == 0) return -999.0f;
+
+    uint64_t average_sq_noise = noise_sq_sum / noise_count;
+
+    // ЗАЩИТА ОТ МЕРТВОЙ ТИШИНЫ: если энергии в пике вообще нет, игнорируем
+    if (max_sq_amp < 10) return -999.0f;
+
+    // Спектральный критерий в квадратичной шкале:
+    // Так как амплитуда возведена в квадрат, отношение SNR тоже возводится в квадрат.
+    // Превышение среднего шума в 3.5 раза в линейной шкале — это 3.5^2 ≈ 12.25 раз в квадратичной!
+    // Используем строгое целочисленное сравнение без деления:
+    if (max_sq_amp > (average_sq_noise * 13)) {
+        float found_freq = (float)max_bin * BIN_RESOLUTION;
+        float freq_error = found_freq - 1000.0f; // Вычисляем сдвиг до ПЧ 1000 Гц
+        return freq_error;
+    }
+
+    return -999.0f;
+}
+
+void coarse_mixer_init(coarse_mixer_t *mixer, float freq_error, short *sine_table_ptr) {
+    mixer->sine_lut = sine_table_ptr;
+    mixer->phase_acc = 0;
+    uint16_t FTW = (unsigned short)((freq_error * 65536.0f) / 8000.0f);
+    printf ("Coarse Mixer FTW: %u\n", FTW);
+
+    // Переводим частоту коррекции в шаг DDS FTW
+    mixer->phase_inc = FTW;
+}
+
+void coarse_mixer_process(coarse_mixer_t *mixer, const cplx_f32 *in_sample, cplx_f32 *out_sample) {
+    unsigned char sin_idx = (unsigned char)(mixer->phase_acc >> 8);
+    unsigned char cos_idx = (unsigned char)((sin_idx + 64) & 0xFF);
+
+    float c = (float)mixer->sine_lut[cos_idx] / 32000.0f;
+    float s = (float)mixer->sine_lut[sin_idx] / 32000.0f;
+
+    // Комплексное перемножение: сдвигаем спектр входного сигнала
+    out_sample->re = in_sample->re * c + in_sample->im * s;
+    out_sample->im = in_sample->im * c - in_sample->re * s;
+
+    mixer->phase_acc = (unsigned short)(mixer->phase_acc + mixer->phase_inc);
+}
+
+// Коэффициенты нормированы (в формате float для модели, легко переводятся в Q15 для CH32V307)
+/*static const float fir_coeffs[FIR_TAPS] = {
+    -0.0012f, -0.0034f, -0.0051f, -0.0042f,  0.0011f,  0.0112f,  0.0234f,  0.0331f,
+     0.0352f,  0.0261f,  0.0041f, -0.0282f, -0.0631f, -0.0924f, -0.1102f, -0.1164f,
+    -0.1102f, -0.0924f, -0.0631f, -0.0282f,  0.0041f,  0.0261f,  0.0352f,  0.0331f,
+     0.0234f,  0.0112f,  0.0011f, -0.0042f, -0.0051f, -0.0034f, -0.0012f,  0.0000f
+};*/
+
+// Новые коэффициенты полосового фильтра 900..1100 Гц (ПЧ 1000 Гц)
+static const float fir_coeffs[FIR_TAPS] = {
+     0.0031f, -0.0021f, -0.0084f,  0.0042f,  0.0182f, -0.0091f, -0.0364f,  0.0182f,
+     0.0651f, -0.0382f, -0.1112f,  0.0812f,  0.2241f, -0.2112f, -0.4502f,  0.4214f,
+     0.4214f, -0.4502f, -0.2112f,  0.2241f,  0.0812f, -0.1112f, -0.0382f,  0.0651f,
+     0.0182f, -0.0364f, -0.0091f,  0.0182f,  0.0042f, -0.0084f, -0.0021f,  0.0031f
+};
+
+static const cplx_f32 fir_coeffs_complex[FIR_TAPX] = {
+	    { 0.0001,  0.0000}, { 0.0002,  0.0002}, { 0.0000,  0.0006}, {-0.0007, -0.0007}, {-0.0016,  0.0000}, { 0.0018,  0.0018}, { 0.0000,  0.0045}, {-0.0049, -0.0049},
+	    {-0.0089,  0.0000}, { 0.0094,  0.0094}, { 0.0000,  0.0205}, {-0.0210, -0.0210}, {-0.0354,  0.0000}, { 0.0355,  0.0355}, { 0.0000,  0.0763}, {-0.0744, -0.0744},
+	    {-0.1287,  0.0000}, { 0.1287,  0.1287}, { 0.0000,  0.2974}, {-0.3048, -0.3048}, {-0.5976,  0.0000}, { 0.6300,  0.6300}, { 0.0000,  1.7450}, {-2.2220, -2.2220},
+	    {-5.7360,  0.0000}, { 8.8850,  8.8850}, { 0.0000, 37.6620},{-85.3520,-85.3520},{-315.652,  0.0000},{838.225,838.225}, { 0.0000,4742.65},{-15220.5,-15220.5},
+	    {15220.5, -15220.5}, { 0.0000, -4742.65},{-838.225,838.225}, {-315.652,  0.0000},{-85.3520,85.3520}, { 0.0000, -37.6620},{ 8.8850, -8.8850}, {-5.7360,  0.0000},
+	    {-2.2220,  2.2220}, { 0.0000,  1.7450}, { 0.6300, -0.6300}, {-0.5976,  0.0000},{-0.3048,  0.3048}, { 0.0000, -0.2974}, { 0.1287, -0.1287}, {-0.1287,  0.0000},
+	    {-0.0744,  0.0744}, { 0.0000, -0.0763}, { 0.0355, -0.0355}, {-0.0354,  0.0000},{-0.0210,  0.0210}, { 0.0000, -0.0205}, { 0.0094, -0.0094}, {-0.0089,  0.0000},
+	    {-0.0049,  0.0049}, { 0.0000, -0.0045}, { 0.0018, -0.0018}, {-0.0016,  0.0000},{-0.0007,  0.0007}, { 0.0000, -0.0006}, { 0.0002, -0.0002}, { 0.0001,  0.0000}
+	};
+
+void fir_filter_init(fir_filter_t *fir) {
+    fir->idx = 0;
+    for (int i = 0; i < FIR_TAPS; i++) {
+        fir->history[i].re = 0.0f;
+        fir->history[i].im = 0.0f;
+    }
+}
+
+void fir_filter_process(fir_filter_t *fir, const cplx_f32 *in_sample, cplx_f32 *out_sample) {
+    fir->history[fir->idx] = *in_sample;
+
+    cplx_f32 acc = {0.0f, 0.0f};
+    int tap_idx = fir->idx;
+
+    for (int i = 0; i < FIR_TAPS; i++) {
+        acc.re += fir->history[tap_idx].re * fir_coeffs[i];
+        acc.im += fir->history[tap_idx].im * fir_coeffs[i];
+
+        tap_idx--;
+        if (tap_idx < 0) tap_idx = FIR_TAPS - 1;
+    }
+
+    *out_sample = acc;
+
+    fir->idx++;
+    if (fir->idx >= FIR_TAPS) fir->idx = 0;
+}
+
+void fir_filter_complex_process(fir_filter_t *fir, const cplx_f32 *in_sample, cplx_f32 *out_sample) {
+    fir->historyx[fir->idx] = *in_sample;
+
+    cplx_f32 acc = {0.0f, 0.0f};
+    int tap_idx = fir->idx;
+
+    for (int i = 0; i < FIR_TAPX; i++) {
+        float sr = fir->historyx[tap_idx].re;
+        float si = fir->historyx[tap_idx].im;
+        float cr = fir_coeffs_complex[i].re;
+        float ci = fir_coeffs_complex[i].im;
+
+        // Комплексное умножение: acc += sample * coeff
+        acc.re += (sr * cr + si * ci);
+        acc.im += (sr * ci - si * cr);
+
+        tap_idx--;
+        if (tap_idx < 0) tap_idx = FIR_TAPX - 1;
+    }
+
+    acc.im *= 0.001f;
+    acc.re *= 0.001f;
+
+    *out_sample = acc;
+
+    fir->idx++;
+    if (fir->idx >= FIR_TAPS) fir->idx = 0;
+}
+

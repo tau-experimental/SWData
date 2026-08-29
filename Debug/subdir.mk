@@ -6,9 +6,11 @@
 C_SRCS += \
 ../barker_sync.c \
 ../carrier_recovery.c \
+../channel_monior.c \
 ../channel_sim.c \
 ../complex_math.c \
 ../conv_encoder.c \
+../costas_loop.c \
 ../fft_sync.c \
 ../galois_field.c \
 ../interleaver.c \
@@ -22,9 +24,11 @@ C_SRCS += \
 C_DEPS += \
 ./barker_sync.d \
 ./carrier_recovery.d \
+./channel_monior.d \
 ./channel_sim.d \
 ./complex_math.d \
 ./conv_encoder.d \
+./costas_loop.d \
 ./fft_sync.d \
 ./galois_field.d \
 ./interleaver.d \
@@ -38,9 +42,11 @@ C_DEPS += \
 OBJS += \
 ./barker_sync.o \
 ./carrier_recovery.o \
+./channel_monior.o \
 ./channel_sim.o \
 ./complex_math.o \
 ./conv_encoder.o \
+./costas_loop.o \
 ./fft_sync.o \
 ./galois_field.o \
 ./interleaver.o \
@@ -64,7 +70,7 @@ OBJS += \
 clean: clean--2e-
 
 clean--2e-:
-	-$(RM) ./barker_sync.d ./barker_sync.o ./carrier_recovery.d ./carrier_recovery.o ./channel_sim.d ./channel_sim.o ./complex_math.d ./complex_math.o ./conv_encoder.d ./conv_encoder.o ./fft_sync.d ./fft_sync.o ./galois_field.d ./galois_field.o ./interleaver.d ./interleaver.o ./main.d ./main.o ./modulator.d ./modulator.o ./puncturing.d ./puncturing.o ./reed_solomon.d ./reed_solomon.o ./scrambler.d ./scrambler.o ./wav_io.d ./wav_io.o
+	-$(RM) ./barker_sync.d ./barker_sync.o ./carrier_recovery.d ./carrier_recovery.o ./channel_monior.d ./channel_monior.o ./channel_sim.d ./channel_sim.o ./complex_math.d ./complex_math.o ./conv_encoder.d ./conv_encoder.o ./costas_loop.d ./costas_loop.o ./fft_sync.d ./fft_sync.o ./galois_field.d ./galois_field.o ./interleaver.d ./interleaver.o ./main.d ./main.o ./modulator.d ./modulator.o ./puncturing.d ./puncturing.o ./reed_solomon.d ./reed_solomon.o ./scrambler.d ./scrambler.o ./wav_io.d ./wav_io.o
 
 .PHONY: clean--2e-
 
