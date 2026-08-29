@@ -1,144 +1,202 @@
 #include <stdio.h>
 #include <string.h>
 #include <stdlib.h>
+#include <time.h>
 #include "conv_encoder.h"
 #include "puncturing.h"
-
-// Генерация псевдослучайных бит (0 или 1) для чистоты эксперимента
-static void generate_random_bits(unsigned char *bits, int len, unsigned int seed) {
-    srand(seed);
-    for (int i = 0; i < len; i++) {
-        bits[i] = rand() % 2;
-    }
-}
+#include "modulator.h"
+#include "channel_sim.h"
+#include "fft_sync.h"
+#include "wav_io.h"
+#include "carrier_recovery.h"
+#include "barker_sync.h"
 
 int main(void) {
-    printf("=== СТАРТ СКВОЗНОГО СТРЕСС-ТЕСТА ЦИФРОВОГО ТРАКТА (v3.0) ===\n\n");
+    srand((unsigned int)time(NULL));
+    printf("=== ГЕНЕРАЦИЯ ПОЛНОГО ЭФИРНОГО ПАКЕТА С ТИШИНОЙ И ПРЕАМБУЛОЙ ===\n\n");
 
-    // 1. Выделение памяти под массивы (статически/на стеке ПК-стенда)
-    unsigned char tx_payload_bits[840+16];
-    unsigned char tx_encoded_1_2[1680+16];
-    unsigned char tx_punctured_5_6[1008+16];
+    viterbi_init_tables();
+    dqpsk_modulator_t modulator;
+    dqpsk_modulator_init(&modulator, 1000, 8000);
 
-    unsigned char rx_depunctured_soft[1680+16];
-    unsigned char rx_decoded_bytes[105+16]; // 840 бит / 8 = 105 байт
-    unsigned char rx_decoded_bits[840+16];
+    qshort_channel_sim_t channel;
+    // SNR = 6 дБ, Дрейф = +20 Гц
+    channel_sim_init(&channel, 6.0, 20.0, 8000.0);
+
+    // Генерируем рандомную длительность тишины (в отсчетах ЦАП при 8000 Гц)
+    // 0.3..0.5 сек -> от 2400 до 4000 отсчетов
+    int quiet_start_samples = 2400 + (rand() % (4000 - 2400 + 1));
+    int quiet_end_samples   = 2400 + (rand() % (4000 - 2400 + 1));
+
+    printf("[ПЛАН ПАКЕТА] Старт тишины: %d отсчетов (~%.3f с)\n", quiet_start_samples, (float)quiet_start_samples/8000.0f);
+    printf("              Пилот-тон:    8000 отсчетов (1.000 с)\n");
+    printf("              Баркер-код:   4800 отсчетов (6 символов, 0.600 с)\n");
+    printf("              Данные:       336000 отсчетов (420 символов, 42.000 с)\n");
+    printf("              Конец тишины: %d отсчетов (~%.3f с)\n\n", quiet_end_samples, (float)quiet_end_samples/8000.0f);
+
+    // Подготовка случайных инфо-данных пакета
+    static unsigned char tx_payload_bits[840];
+    static unsigned char tx_encoded_1_2[1680];
+    static unsigned char tx_punctured_5_6[1008];
+    for (int i = 0; i < 834; i++) tx_payload_bits[i] = rand() % 2;
+    for (int i = 834; i < 840; i++) tx_payload_bits[i] = 0; // Zero-Tail
 
     conv_encoder_t encoder;
-    viterbi_init_tables();
-
-    // Генерируем тестовую последовательность (последние 6 бит ОБЯЗАТЕЛЬНО нули для Zero-Tail)
-    generate_random_bits(tx_payload_bits, 840, 0xACE);
-    for (int i = 834; i < 840; i++) {
-        tx_payload_bits[i] = 0;
-    }
-
-    printf("[TX] Шаг 1: Сверточное кодирование Rate 1/2...\n");
     conv_encoder_reset(&encoder);
     conv_encode_pure_1_2(&encoder, tx_payload_bits, tx_encoded_1_2);
-    printf("[TX] OK: Сгенерировано %d плоских бит.\n", 1680);
-
-    // Контрольный чих №1: Вывод первых 16 бит после кодера
-    printf("[ОТЛАДКА] Первые 16 кодированных бит: ");
-    for(int i=0; i<16; i++) printf("%d", tx_encoded_1_2[i]);
-    printf("\n\n");
-    printf("\n--- [ИНСПЕКЦИЯ ВЫХОДА КОДЕРА] ---\n");
-    // Моделируем состояние регистра кодера локально для шагов 720-723
-    unsigned char local_reg = 0;
-    // Сначала быстро «прокрутим» регистр до 719 шага, чтобы он встал в нужную фазу
-    for (int s = 0; s < 720; s++) {
-        local_reg = ((local_reg << 1) | tx_payload_bits[s]) & 0x3F;
-    }
-
-    // Теперь детально проверяем шаги 720-723
-    for (int s = 720; s <= 723; s++) {
-        unsigned char bit = tx_payload_bits[s];
-        // Находим теоретический дибит по полиномам NASA (сдвиг влево)
-        // Внимание: используем логику вашей инициализации таблиц
-        int next_state = ((local_reg << 1) | bit) & 0x3F;
-
-        // Читаем, что РЕАЛЬНО записал кодер в плоский массив tx_encoded_1_2
-        unsigned char real_g1 = tx_encoded_1_2[s * 2];
-        unsigned char real_g2 = tx_encoded_1_2[s * 2 + 1];
-
-        // Читаем, что для этого перехода прописано в таблице out_bits
-        unsigned char packed_dibit = out_bits[local_reg][bit];
-        unsigned char table_g1 = (packed_dibit >> 1) & 1;
-        unsigned char table_g2 = packed_dibit & 1;
-
-        printf("Шаг %d (Инфо-бит %d): Текущий регистр кодера = %d\n", s, bit, local_reg);
-        printf("         Из массива tx_encoded_1_2: G1=%d, G2=%d\n", real_g1, real_g2);
-        printf("         Из таблицы out_bits:       G1=%d, G2=%d\n", table_g1, table_g2);
-
-        // Обновляем регистр для следующего шага
-        local_reg = next_state;
-    }
-    printf("----------------------------------\n\n");
-
-    printf("[TX] Шаг 2: Применение выкалывания (Puncturing) 1680 -> 1008...\n");
     apply_puncturing(tx_encoded_1_2, tx_punctured_5_6);
-    printf("[TX] OK: Поток упакован в %d бит для эфира.\n\n", 1008);
 
+    wav_stream_t wav_rx;
+    if (wav_open_write(&wav_rx, "rx_packet_full.wav") != 1) return -1;
 
-    // ================= КАНАЛ СВЯЗИ С ОШИБКАМИ =================
-    printf("[КАНАЛ] Вносим 5 изолированных инверсий бит в выколотый поток (Стресс-тест)...\n");
-    // Переворачиваем биты в разных частях пакета
-    tx_punctured_5_6[10]  ^= 1;
-    tx_punctured_5_6[200] ^= 1;
-    tx_punctured_5_6[500] ^= 1;
-    tx_punctured_5_6[750] ^= 1;
-    tx_punctured_5_6[990] ^= 1;
-    printf("[КАНАЛ] OK: Ошибки добавлены.\n\n");
-    // ==========================================================
+    cplx_f32 clean_sample, corrupted_sample;
 
-
-    printf("[RX] Шаг 3: Восстановление выколотых бит (Depuncturing) -> Софт-биты...\n");
-    apply_depuncturing(tx_punctured_5_6, rx_depunctured_soft);
-    printf("[RX] OK: Сформировано %d мягких отсчетов.\n", 1680);
-
-    // Контрольный чих №2: Проверяем, как депунктуризатор пометил стертые биты и ошибки
-    printf("[ОТЛАДКА] Первые 10 мягких отсчетов (ищите 127 для выколотых): ");
-    for(int i=0; i<10; i++) printf("%d ", rx_depunctured_soft[i]);
-    printf("\n\n");
-
-    printf("[RX] Шаг 4: Запуск мягкого декодера Витерби (Zero-Tail, O(1) Traceback)...\n");
-    viterbi_decode_soft_1_2(rx_depunctured_soft, rx_decoded_bytes);
-    //viterbi_debug (tx_payload_bits, rx_depunctured_soft, rx_decoded_bytes);
-    printf("[RX] OK: Декодирование завершено.\n\n");
-
-    // Распаковываем байты обратно в биты для побитового сравнения 1-в-1
-    for (int step = 0; step < 840; step++) {
-        int byte_pos = step / 8;
-        int bit_pos = 7 - (step % 8);
-        rx_decoded_bits[step] = (rx_decoded_bytes[byte_pos] >> bit_pos) & 1;
+    // --- ЭТАП 1: Начальная тишина (чистый шум эфира) ---
+    clean_sample.re = 0.0f;
+    clean_sample.im = 0.0f;
+    for (int i = 0; i < quiet_start_samples; i++) {
+        channel_sim_process(&channel, &clean_sample, &corrupted_sample);
+        wav_write_sample(&wav_rx, &corrupted_sample);
     }
 
-    // ВЕРИФИКАЦИЯ: Сравнение исходного массива с восстановленным
-    printf("=== ВЕРИФИКАЦИЯ РЕЗУЛЬТАТОВ ===\n");
-    int error_coords[32];
-    int total_errors = 0;
+    // --- ЭТАП 2: Пилот-тон 1.0 сек (Чистая несущая 1000 Гц без модуляции) ---
+    // Чтобы не было фазового скачка, берем фазовую поправку = 0
+    for (int i = 0; i < 8000; i++) {
+        short raw_i, raw_q;
+        dqpsk_synth_tick(&modulator, 0, &raw_i, &raw_q);
+        clean_sample.re = (float)raw_i / 32000.0f;
+        clean_sample.im = (float)raw_q / 32000.0f;
 
-    for (int i = 0; i < 840; i++) {
-        if (tx_payload_bits[i] != rx_decoded_bits[i]) {
-            if (total_errors < 32) {
-                error_coords[total_errors] = i;
-            }
-            total_errors++;
+        channel_sim_process(&channel, &clean_sample, &corrupted_sample);
+        wav_write_sample(&wav_rx, &corrupted_sample);
+    }
+
+    // --- ЭТАП 3: Преамбула Баркера (6 DQPSK-символов) ---
+    // Модулятор сам прогонит биты Баркера через dqpsk_synth_tick и выдаст в канал
+    // Для совместимости с потоковым зашумлением временно перенаправим вывод.
+    // Но проще сделать это прямо в цикле здесь, чтобы сохранить сквозной канал:
+    unsigned char barker_bits[12] = {1,1, 1,0, 0,0, 1,0, 0,1, 0,0};
+    for (int sym = 0; sym < 6; sym++) {
+        unsigned short phase_shift = dqpsk_get_phase_shift(barker_bits[sym * 2], barker_bits[sym * 2 + 1]);
+        for (int s = 0; s < 800; s++) {
+            short raw_i, raw_q;
+            unsigned short current_shift = (s == 0) ? phase_shift : 0;
+            dqpsk_synth_tick(&modulator, current_shift, &raw_i, &raw_q);
+            clean_sample.re = (float)raw_i / 32000.0f;
+            clean_sample.im = (float)raw_q / 32000.0f;
+
+            channel_sim_process(&channel, &clean_sample, &corrupted_sample);
+            wav_write_sample(&wav_rx, &corrupted_sample);
         }
     }
 
-    if (total_errors == 0) {
-        printf("🎉 ИДЕАЛЬНО! Витерби сожрал 5 КВ-ошибок и восстановил данные со 100%% точностью!\n");
-        printf("Цифровой кодек полностью стабилен и готов к сопряжению с радио-модулятором.\n");
-    } else {
-        printf("❌ ТЕСТ ПРОВАЛЕН! Найдено %d ошибок декодирования.\n", total_errors);
-        printf("[КООРДИНАТЫ ОШИБОК]: ");
-        for (int i = 0; i < (total_errors < 32 ? total_errors : 32); i++) {
-            printf("%d ", error_coords[i]);
+    // --- ЭТАП 4: Информационные данные (420 символов) ---
+    for (int sym = 0; sym < 420; sym++) {
+        unsigned short phase_shift = dqpsk_get_phase_shift(tx_punctured_5_6[sym * 2], tx_punctured_5_6[sym * 2 + 1]);
+        for (int s = 0; s < 800; s++) {
+            short raw_i, raw_q;
+            unsigned short current_shift = (s == 0) ? phase_shift : 0;
+            dqpsk_synth_tick(&modulator, current_shift, &raw_i, &raw_q);
+            clean_sample.re = (float)raw_i / 32000.0f;
+            clean_sample.im = (float)raw_q / 32000.0f;
+
+            channel_sim_process(&channel, &clean_sample, &corrupted_sample);
+            wav_write_sample(&wav_rx, &corrupted_sample);
         }
-        printf("\n\n[СОВЕТ]: Если упало в самом начале — проверяйте инициализацию метрик. Если в конце — разберитесь с шагом Traceback или Zero-Tail.");
-        return -1;
     }
 
+    // --- ЭТАП 5: Финальная тишина (чистый шум эфира) ---
+    clean_sample.re = 0.0f;
+    clean_sample.im = 0.0f;
+    for (int i = 0; i < quiet_end_samples; i++) {
+        channel_sim_process(&channel, &clean_sample, &corrupted_sample);
+        wav_write_sample(&wav_rx, &corrupted_sample);
+    }
+
+    wav_close(&wav_rx);
+    printf("🎉 СИГНАЛ ЗАПИСАН В 'rx_packet_full.wav'. Тракт передачи полностью готов к приему.\n");
+    //--------------------------------- ПРИЁМ
+    // Verification snippet to evaluate Pilot Tone detection under SNR = 6dB
+#if 0
+    printf("\n=== RUNNING EXTRACT FROM RECEIVER SPECTRAL ANALYSIS ===\n");
+    fft_init_tables();
+
+    wav_stream_t wav_in;
+    wav_open_read(&wav_in, "rx_packet_full.wav");
+
+    cplx_f32 block_float[1024];
+    int16_t block_mcu_i[256];
+    int16_t block_mcu_q[256];
+
+    float heavy_spectrum[1024];
+    uint32_t light_spectrum[256];
+
+    // Read deep enough into the file where the Pilot Tone is guaranteed to be active
+    // Skip 6000 samples (~0.75 seconds of mixed silence + early pilot)
+    cplx_f32 temp;
+    for (int s = 0; s < 6000; s++) wav_read_sample(&wav_in, &temp);
+
+    // Read data arrays for both tests concurrently
+    for (int i = 0; i < 1024; i++) {
+        wav_read_sample(&wav_in, &block_float[i]);
+        if (i < 256) {
+            // Convert float IQ back to standard 16-bit signed integer values for the MCU block
+            block_mcu_i[i] = (int16_t)(block_float[i].re * 32000.0f);
+            block_mcu_q[i] = (int16_t)(block_float[i].im * 32000.0f);
+        }
+    }
+    wav_close(&wav_in);
+
+    // Compute both spectra
+    fft_heavy_1024(block_float, heavy_spectrum);
+    fft_light_fixed256(block_mcu_i, block_mcu_q, light_spectrum);
+
+    // Print Heavy FFT results near 1000Hz (Bins 120 to 140 for N=1024, res = 7.8Hz)
+    printf("\n[PC TRUTH MODEL - 1024 FLOAT FFT] Slices near 1000Hz:\n");
+    for (int b = 126; b <= 134; b++) {
+        printf("  Bin %d (~%.1f Hz): Magnitude = %.2f\n", b, b * 7.8125f, heavy_spectrum[b]);
+    }
+
+    // Print Light MCU FFT results near 1000Hz (Bins 30 to 35 for N=256, res = 31.25Hz)
+    printf("\n[MCU PRODUCTION - 256 FIXED-POINT FFT] Slices near 1000Hz:\n");
+    for (int b = 30; b <= 35; b++) {
+        printf("  Bin %d (~%.1f Hz): Energy Value = %u\n", b, b * 31.25f, light_spectrum[b]);
+    }
+#else
+    printf("\n=== СКВОЗНОЙ ТЕСТ СИНХРОНИЗАЦИИ: ФАПЧ + БАРКЕР ===\n");
+
+	pll_tracker_t pll;
+	pll_tracker_init(&pll, 33, modulator.sine_lut); // Инициализация бином 33
+
+	barker_sync_t barker;
+	barker_sync_init(&barker);
+
+	wav_stream_t wav_in;
+	wav_open_read(&wav_in, "rx_packet_full.wav");
+
+	cplx_f32 rx_sample, pll_sample;
+	float corr_power = 0.0f;
+	int b_step = 0;
+
+	while (wav_read_sample(&wav_in, &rx_sample) == 1) {
+		// 1. Выравниваем частоту через ФАПЧ
+		pll_tracker_tick(&pll, &rx_sample, &pll_sample);
+
+		// 2. Скармливаем очищенный отсчет коррелятору Баркера
+		if (barker_sync_tick(&barker, &pll_sample, &corr_power) == 1) {
+			printf("\n🎯 [МАРКЕР ОБНАРУЖЕН!] Отсчет файла: %d | Мощность пика корреляции = %.4f\n",
+				   b_step, corr_power);
+			printf("⏰ Временная засечка зафиксирована. Начинается отсчет информационных бит пакета!\n\n");
+		}
+
+		// Выводим срез мощности каждые 800 отсчетов (в моменты вычисления символов преамбулы)
+		if (b_step > 0 && b_step % 800 == 0 && corr_power > 0.001f) {
+			printf("Символ на отсчете %5d: Текущая мощность корреляции Баркера = %.4f\n", b_step, corr_power);
+		}
+
+		b_step++;
+	}
+    wav_close(&wav_in);
+#endif
     return 0;
 }
