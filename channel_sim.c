@@ -15,6 +15,8 @@ void channel_sim_init(qshort_channel_sim_t *sim, double snr_db, double freq_offs
     double snr_linear = pow(10.0, snr_db / 10.0);
     double power_noise = 0.5 / snr_linear;
     sim->noise_sigma = sqrt(power_noise);
+
+    printf ("Эмулятор радиоканала готов к работе, SNR %+4.1f, начальный частотный сдвиг %+4.1f\n", snr_db, freq_offset_hz);
 }
 
 // Вспомогательный генератор Гауссова шума (Бокс-Мюллер)

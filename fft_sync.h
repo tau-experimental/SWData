@@ -9,9 +9,23 @@
 #define FIR_TAPS 32
 #define FIR_TAPX 64
 
+#define PILOT_MIN_BIN 20 /* 625 Гц */
+#define PILOT_MAX_BIN 44 /* 1375 Гц */
+
+// Коэффициенты для квадратичной шкалы: 11.0f ≈ 3.3х в линейной, 7.5f ≈ 2.7х в линейной
+#define PILOT_THRESH_STRICT   11
+#define PILOT_THRESH_RELAXED  7
+
+#define COARSE_WIDTH	32
+
 typedef struct {
-    unsigned short phase_acc;
-    unsigned short phase_inc;
+#if (COARSE_WIDTH==16)
+    uint16_t phase_acc;
+    uint16_t phase_inc;
+#else
+    uint32_t phase_acc;
+    uint32_t phase_inc;
+#endif
     short *sine_lut;
 } coarse_mixer_t;
 

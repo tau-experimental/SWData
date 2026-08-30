@@ -103,6 +103,20 @@ int barker_sync_tick(barker_sync_t *sync, const cplx_f32 *pll_output_sample, flo
     return 0;
 }
 
+// Структура для инициализации шаблона (вычислить на старте на основе вашей dqpsk_get_phase_shift)
+// Ожидаемые комплексные переходы для 5 дифференциальных шагов Баркера
+static const cplx_f32 template_barker_diff[BARKER_DIFF_STEPS] = {
+    { 0.707107f,  0.707107f }, // Переход 0 (символ 1: +1)
+    { 0.707107f,  0.707107f }, // Переход 1 (символ 2: +1)
+    { 0.707107f, -0.707107f }, // Переход 2 (символ 3: -1)
+    { 0.707107f, -0.707107f }, // Переход 3 (символ 4: -1)
+    { 0.707107f, -0.707107f }, // Переход 4 (символ 5: -1)
+    { 0.707107f,  0.707107f }, // Переход 5 (символ 6: +1)
+    { 0.707107f, -0.707107f }, // Переход 6 (символ 7: -1)
+    { 0.707107f, -0.707107f }, // Переход 7 (символ 8: -1)
+    { 0.707107f,  0.707107f }, // Переход 8 (символ 9: +1)
+    { 0.707107f, -0.707107f }  // Переход 9 (символ 10: -1)
+};
 void barker_sliding_init(barker_sliding_t *sync) {
     sync->running_sum.re = 0.0f;
     sync->running_sum.im = 0.0f;
@@ -111,97 +125,166 @@ void barker_sliding_init(barker_sliding_t *sync) {
     memset(sync->delay_line, 0, sizeof(sync->delay_line));
     memset(sync->symbol_history, 0, sizeof(sync->symbol_history));
 
-    // Идеальный кумулятивный фазовый трек (дифференциальный накат Баркера-11):
-    double cumulative_angles[6] = {
-        -3.0 * M_PI / 4.0, // Символ 0 (самый старый в истории)
-        M_PI,              // Символ 1
-        -3.0 * M_PI / 4.0, // Символ 2
-        M_PI,              // Символ 3
-        -M_PI / 4.0,       // Символ 4
-        0.0                // Символ 5 (самый свежий символ)
-    };
-
-    for (int i = 0; i < 6; i++) {
-        sync->template_barker[i].re = (float)cos(cumulative_angles[i]);
-        sync->template_barker[i].im = (float)sin(cumulative_angles[i]);
+    for (int i = 0; i < BARKER_DIFF_STEPS; i++) {
+        //double phase = (template_barker_diff[i].re > 0) ? 0 : M_PI;
+        sync->template_barker[i].re = template_barker_diff[i].re;//(float)cos(phase);
+        sync->template_barker[i].im = template_barker_diff[i].im;//(float)sin(phase);
     }
+    sync->sample_cnt = 0;
+
+    memset(sync->macro_history, 0, sizeof(sync->macro_history));
+    sync->macro_sample_cnt = 0;
+
+    sync->diff_delay_idx = 0;
+    memset(sync->diff_delay_line, 0, sizeof(sync->diff_delay_line));
 }
 
-int barker_sliding_tick(barker_sliding_t *sync, const cplx_f32 *pll_output_sample, float *out_corr_power) {
-    // === ЭТАП 1: Скользящий CIC-интегратор (окно 800 сэмплов) ===
-    // Из бегущей суммы вычитаем отсчет, который улетел назад на 800 шагов
-    sync->running_sum.re -= sync->delay_line[sync->delay_idx].re;
-    sync->running_sum.im -= sync->delay_line[sync->delay_idx].im;
+// b_step только для отладки, do not forget to remove it nahren!
+int barker_sliding_tick(barker_sliding_t *sync, const cplx_f32 *pll_output_sample, float *out_corr_power, int b_step) {
+#if 0
+    // === ЭТАП 1: Дифференциальный демодулятор на лету ===
+    // Извлекаем сэмпл, который был ровно 800 отсчетов назад
+    cplx_f32 oldest_sample = sync->delay_line[sync->delay_idx];
 
-    // Записываем новый отсчет в линию задержки
+    // Вычисляем мгновенный дифференциальный переход между "сейчас" и "800 сэмплов назад"
+    // Формула: diff = pll_output_sample * conj(oldest_sample)
+    cplx_f32 current_diff;
+    current_diff.re = pll_output_sample->re * oldest_sample.re + pll_output_sample->im * oldest_sample.im;
+    current_diff.im = pll_output_sample->im * oldest_sample.re - pll_output_sample->re * oldest_sample.im;
+
+    // Обновляем линию задержки сырых сэмплов
     sync->delay_line[sync->delay_idx] = *pll_output_sample;
-
-    // Добавляем новый отсчет в бегущую сумму
-    sync->running_sum.re += pll_output_sample->re;
-    sync->running_sum.im += pll_output_sample->im;
-
-    // Продвигаем индекс кольцевого буфера
     sync->delay_idx++;
-    if (sync->delay_idx >= 800) {
-        sync->delay_idx = 0;
-    }
+    if (sync->delay_idx >= 800) sync->delay_idx = 0;
 
-    // Вычисляем среднее значение (finished_symbol) для текущего мгновения
-    cplx_f32 current_symbol;
-    current_symbol.re = sync->running_sum.re / 800.0f;
-    current_symbol.im = sync->running_sum.im / 800.0f;
+    // === ЭТАП 2: Скользящая история 5 дифференциальных шагов ===
+    // Чтобы проверить корреляцию 5 переходов, нам нужно знать, какими были
+    // дифференциальные переходы 800, 1600, 2400, 3200 сэмплов назад.
+    // Для этого нам нужен кольцевой буфер ДИФФЕРЕНЦИАЛЬНЫХ переходов на 4000 элементов
+    sync->cic_history[sync->cic_hist_idx] = current_diff;
 
-    // === ЭТАП 2: Каскадирование истории (Продвижение на 1 сэмпл) ===
-    // Каждые 800 сэмплов — это независимые символы. Значит, в истории должны лежать
-    // точки, отстоящие друг от друга строго на 800 отсчетов!
-    // Мы берем текущую точку как символ 5, а предыдущие берем из линии задержки CIC.
-
-    sync->symbol_history[5] = current_symbol;
-
-    // Извлекаем из нашей delay_line исторические шаги назад с шагом 800 сэмплов.
-    // На самом деле, благодаря CIC, "прошлые" символы — это просто состояния
-    // интегратора, которые были раньше. Но для скользящего теста мы можем
-    // сэмулировать верхний сдвиг:
+    cplx_f32 d[6];
     for (int i = 0; i < 5; i++) {
-        // Чтобы не городить еще 5 буферов по 800, при скользящем тесте на каждом сэмпле
-        // мы можем делать обычный сдвиг. Математически пик возникнет ровно тогда,
-        // когда сетка сэмплов идеально совпадет с границей кадра.
-        sync->symbol_history[i] = sync->symbol_history[i + 1];
-    }
-    sync->symbol_history[5] = current_symbol;
+        int steps_back = (4 - i) * 800; // 5 переходов (индексы 0..4)
+        int hist_idx = sync->cic_hist_idx - steps_back;
+        if (hist_idx < 0) hist_idx += 4000; // Буфер cic_history теперь равен 4000 элементов!
 
-    // Считаем полную энергию оконной истории для АРУ нормализации
+        d[i] = sync->cic_history[hist_idx];
+    }
+
+    sync->cic_hist_idx++;
+    if (sync->cic_hist_idx >= 4000) sync->cic_hist_idx = 0;
+
+    // Считаем энергию дифференциального окна (теперь модули будут около 1.0!)
     float window_energy = 0.0f;
-    for (int i = 0; i < 6; i++) {
-        window_energy += (sync->symbol_history[i].re * sync->symbol_history[i].re +
-                          sync->symbol_history[i].im * sync->symbol_history[i].im);
+    for (int i = 0; i < 5; i++) {
+        window_energy += (d[i].re * d[i].re + d[i].im * d[i].im);
     }
 
-    if (window_energy < 1e-6f) {
+    // Жесткая отсечка тишины (для амплитуды 1.0 энергия 5 элементов будет около 5.0)
+    if (window_energy < 1e-4f) {
         *out_corr_power = 0.0f;
         return 0;
     }
 
-    // === ЭТАП 3: Комплексная взаимная корреляция ===
+    // === ЭТАП 3: Взаимная корреляция векторов ===
     cplx_f32 corr_sum = {0.0f, 0.0f};
-    for (int i = 0; i < 6; i++) {
-        float hr = sync->symbol_history[i].re;
-        float hi = sync->symbol_history[i].im;
-        float tr = sync->template_barker[i].re;
-        float ti = sync->template_barker[i].im;
+    for (int i = 0; i < 5; i++) {
+        // Скалярное произведение с комплексным сопряжением шаблона (d * conj(template))
+        corr_sum.re += (d[i].re * template_barker_diff[i].re + d[i].im * template_barker_diff[i].im);
+        corr_sum.im += (d[i].im * template_barker_diff[i].re - d[i].re * template_barker_diff[i].im);
+    }
 
+    float abs_power = corr_sum.re * corr_sum.re + corr_sum.im * corr_sum.im;
+    float normalized_power = abs_power / (window_energy * 5.0f);
+    *out_corr_power = normalized_power;
+
+    // Временный диагностический шпион
+    if (b_step == 16276) {
+        printf("\n🕵️‍♂️ [МГНОВЕННЫЙ ШПИОН]:\n");
+        printf("  -> window_energy: %f\n", window_energy);
+        printf("  -> normalized_power: %f\n", normalized_power);
+    }
+
+    if (normalized_power > 0.75f) return 1;
+    return 0;
+#else
+    // === ЭТАП 1: Мгновенный дифференциальный демодулятор ===
+    // === ЭТАП 1: Мгновенный дифференциальный демодулятор ===
+    cplx_f32 oldest_sample = sync->delay_line[sync->delay_idx];
+
+    cplx_f32 current_diff;
+    current_diff.re = pll_output_sample->re * oldest_sample.re + pll_output_sample->im * oldest_sample.im;
+    current_diff.im = pll_output_sample->im * oldest_sample.re - pll_output_sample->re * oldest_sample.im;
+
+    sync->delay_line[sync->delay_idx] = *pll_output_sample;
+
+    // === ЭТАП 2: Скользящий CIC-интегратор над дифференциальным сигналом ===
+    cplx_f32 oldest_diff = sync->diff_delay_line[sync->delay_idx];
+
+    sync->running_sum.re -= oldest_diff.re;
+    sync->running_sum.im -= oldest_diff.im;
+
+    sync->diff_delay_line[sync->delay_idx] = current_diff;
+
+    sync->running_sum.re += current_diff.re;
+    sync->running_sum.im += current_diff.im;
+
+    sync->delay_idx++;
+    if (sync->delay_idx >= 800) sync->delay_idx = 0;
+
+    // Свежее интегрированное значение дифференциального перехода
+    cplx_f32 integrated_diff;
+    integrated_diff.re = sync->running_sum.re / 800.0f;
+    integrated_diff.im = sync->running_sum.im / 800.0f;
+
+    // === ЭТАП 3: Синхронное скольжение макро-истории ===
+    sync->macro_history[BARKER_DIFF_STEPS - 1] = integrated_diff;
+
+    // Расчет энергии и взаимной корреляции векторов
+    float window_energy = 0.0f;
+    cplx_f32 corr_sum = {0.0f, 0.0f};
+
+    for (int i = 0; i < BARKER_DIFF_STEPS; i++) {
+        window_energy += (sync->macro_history[i].re * sync->macro_history[i].re +
+                          sync->macro_history[i].im * sync->macro_history[i].im);
+
+        float hr = sync->macro_history[i].re;
+        float hi = sync->macro_history[i].im;
+        float tr = template_barker_diff[i].re;
+        float ti = template_barker_diff[i].im;
+
+        // Взаимная корреляция: Сигнал * conj(Шаблон)
         corr_sum.re += (hr * tr + hi * ti);
         corr_sum.im += (hi * tr - hr * ti);
     }
 
-    float abs_power = corr_sum.re * corr_sum.re + corr_sum.im * corr_sum.im;
-    float normalized_power = abs_power / (window_energy * 6.0f);
-    *out_corr_power = normalized_power;
-
-    // На скользящем окне пик будет очень острым и тонким — шириной ровно в 1 сэмпл!
-    if (normalized_power > 0.65f) {
-        return 1; // Точное попадание в сэмпл синхронизации!
+    // ЖЕСТКАЯ ЗАЩИТА ОТ ТИШИНЫ И ДЕЛЕНИЯ НА НОЛЬ
+    // Для нормального сигнала амплитудой ~1.0 суммарная энергия 10 элементов должна быть около 10.0.
+    // Если она падает ниже 0.01 — это либо тишина, либо ортогональная каша. Обнуляем!
+    if (window_energy < 0.01f) {
+        *out_corr_power = 0.0f;
+        return 0;
     }
 
+    float abs_power = corr_sum.re * corr_sum.re + corr_sum.im * corr_sum.im;
+    float normalized_power = abs_power / (window_energy * (float)BARKER_DIFF_STEPS);
+
+    // Защитный хак от математического джиттера: ограничиваем потолок единицей
+    if (normalized_power > 1.0f) normalized_power = 1.0f;
+
+    *out_corr_power = normalized_power;
+
+    // === ЭТАП 4: Дискретный сдвиг стабильного прошлого ===
+    if (sync->delay_idx == 0) {
+        for (int i = 0; i < (BARKER_DIFF_STEPS - 1); i++) {
+            sync->macro_history[i] = sync->macro_history[i + 1];
+        }
+    }
+
+    // Для DBPSK-11 порог можно смело ставить на 0.75..0.80
+    if (normalized_power > 0.65f) return 1;
     return 0;
+
+#endif
 }

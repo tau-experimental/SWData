@@ -102,8 +102,8 @@ void fft_heavy_1024(const cplx_f32 *in_samples, float *out_magnitude) {
 // ============================================================================
 void fft_light_fixed256(const int16_t *in_i, const int16_t *in_q, uint32_t *out_sq_magnitude) {
     // Local working buffers to perform in-place bit-shifting operations
-    static int16_t fr[256];
-    static int16_t fi[256];
+    int16_t fr[256];
+    int16_t fi[256];
 
     // Stage 1: Load, apply Q15 Hamming window, and Bit-Reverse simultaneously
     // To prevent fixed-point addition overflow during butterfly stages,
@@ -115,8 +115,8 @@ void fft_light_fixed256(const int16_t *in_i, const int16_t *in_q, uint32_t *out_
         int32_t i_win = ((int32_t)in_i[i] * mcu_hamming_q15[i]) >> 15;
         int32_t q_win = ((int32_t)in_q[i] * mcu_hamming_q15[i]) >> 15;
 
-        fr[rev_idx] = (int16_t)(i_win >> 4);
-        fi[rev_idx] = (int16_t)(q_win >> 4);
+        fr[rev_idx] = (int16_t)(i_win ); // было >> 4
+        fi[rev_idx] = (int16_t)(q_win ); // ...
     }
 
     // Stage 2: Fixed-point Cooley-Tukey Butterflies (8 stages for N=256)
@@ -142,11 +142,17 @@ void fft_light_fixed256(const int16_t *in_i, const int16_t *in_q, uint32_t *out_
                 int32_t tr = ((int32_t)fr[match] * wr - (int32_t)fi[match] * wi) >> 15;
                 int32_t ti = ((int32_t)fr[match] * wi + (int32_t)fi[match] * wr) >> 15;
 
-                // Butterfly additions/subtractions (safe from overflow due to initial downscaling)
-                fr[match] = fr[base] - (int16_t)tr;
-                fi[match] = fi[base] - (int16_t)ti;
-                fr[base] += (int16_t)tr;
-                fi[base] += (int16_t)ti;
+                // Вычисляем новые значения во временных 32-битных переменных
+                int32_t new_match_r = fr[base] - tr;
+                int32_t new_match_i = fi[base] - ti;
+                int32_t new_base_r  = fr[base] + tr;
+                int32_t new_base_i  = fi[base] + ti;
+
+                // Безопасно масштабируем на 1 бит (деление на 2) на каждом этапе
+                fr[match] = (int16_t)(new_match_r >> 1);
+                fi[match] = (int16_t)(new_match_i >> 1);
+                fr[base]  = (int16_t)(new_base_r >> 1);
+                fi[base]  = (int16_t)(new_base_i >> 1);
             }
         }
     }
@@ -159,6 +165,9 @@ void fft_light_fixed256(const int16_t *in_i, const int16_t *in_q, uint32_t *out_
     }
 }
 
+// Переменная для накопления детекции (вынести в глобальную область rx-структуры или сделать static)
+static int pilot_detection_counter = 0;
+static int last_stable_bin = -1;
 // Возвращает расстройку в Гц, если пилот найден, или -999.0f, если в эфире только шум
 // Сканирует целочисленный спектр.
 float check_mcu_spectrum_for_pilot(const uint32_t *out_sq_magnitude) {
@@ -167,51 +176,95 @@ float check_mcu_spectrum_for_pilot(const uint32_t *out_sq_magnitude) {
     uint64_t noise_sq_sum = 0;
     int noise_count = 0;
 
-    // 1. Сканируем спектр (до частоты Найквиста - 128 бин)
+    // 1. Ищем максимум во всей разрешенной полосе поиска (с защитой краев)
+    for (int bin = PILOT_MIN_BIN; bin <= PILOT_MAX_BIN; bin++) {
+        if (out_sq_magnitude[bin] > max_sq_amp) {
+            max_sq_amp = out_sq_magnitude[bin];
+            max_bin = bin;
+        }
+    }
+
+    // 2. Считаем шум строго ЗА ПРЕДЕЛАМИ расширенной зоны пилота, чтобы пик не «отравлял» среднее
     for (int bin = 0; bin < 128; bin++) {
-        if (bin >= 29 && bin <= 35) {
-            if (out_sq_magnitude[bin] > max_sq_amp) {
-                max_sq_amp = out_sq_magnitude[bin];
-                max_bin = bin;
-            }
-        } else {
-            // Суммируем квадраты энергий шумовых бинов
+        // Исключаем зону пилота с запасом ±5 бинов от краев поиска для точности
+        if (bin < (PILOT_MIN_BIN - 2) || bin > (PILOT_MAX_BIN + 2)) {
             noise_sq_sum += out_sq_magnitude[bin];
             noise_count++;
         }
     }
 
-    if (max_bin == -1 || noise_count == 0) return -999.0f;
+    if (max_bin == -1 || noise_count == 0) {
+        pilot_detection_counter = 0;
+        return -999.0f;
+    }
 
     uint64_t average_sq_noise = noise_sq_sum / noise_count;
 
-    // ЗАЩИТА ОТ МЕРТВОЙ ТИШИНЫ: если энергии в пике вообще нет, игнорируем
-    if (max_sq_amp < 10) return -999.0f;
-
-    // Спектральный критерий в квадратичной шкале:
-    // Так как амплитуда возведена в квадрат, отношение SNR тоже возводится в квадрат.
-    // Превышение среднего шума в 3.5 раза в линейной шкале — это 3.5^2 ≈ 12.25 раз в квадратичной!
-    // Используем строгое целочисленное сравнение без деления:
-    if (max_sq_amp > (average_sq_noise * 13)) {
-        float found_freq = (float)max_bin * BIN_RESOLUTION;
-        float freq_error = found_freq - 1000.0f; // Вычисляем сдвиг до ПЧ 1000 Гц
-        return freq_error;
+    // Минимальный порог абсолютной энергии (для новой шкалы после scale-on-stage)
+    if (max_sq_amp < 500) {
+        pilot_detection_counter = 0;
+        return -999.0f;
     }
 
+    // Выбираем порог: если мы уже ведем цель, порог мягче (RELAXED), если только ищем — жестче (STRICT)
+    int current_threshold = (pilot_detection_counter > 0) ? PILOT_THRESH_RELAXED : PILOT_THRESH_STRICT;
+
+    if (max_sq_amp > (average_sq_noise * current_threshold)) {
+        // Логика инерциального фильтра
+        if (last_stable_bin != -1 && abs(max_bin - last_stable_bin) <= 2) { // на -16дБ расширяем дельту до ±2 бинов
+            pilot_detection_counter++;
+        } else {
+            pilot_detection_counter = 1;
+        }
+        last_stable_bin = max_bin;
+
+        if (pilot_detection_counter < 2) {
+            return -999.0f;
+        }
+
+        // Взвешенная интерполяция
+        float Estimated_bin = (float)max_bin;
+        if (max_bin > 0 && max_bin < 127) {
+            uint64_t p_left   = out_sq_magnitude[max_bin - 1];
+            uint64_t p_center = out_sq_magnitude[max_bin];
+            uint64_t p_right  = out_sq_magnitude[max_bin + 1];
+            uint64_t total_p  = p_left + p_center + p_right;
+
+            if (total_p > 0) {
+                Estimated_bin = ((float)(max_bin - 1) * p_left + (float)max_bin * p_center + (float)(max_bin + 1) * p_right) / (float)total_p;
+            }
+        }
+
+        float found_freq = Estimated_bin * BIN_RESOLUTION;
+        return found_freq - 1000.0f;
+    }
+
+    if (pilot_detection_counter > 0) pilot_detection_counter--;
     return -999.0f;
 }
 
 void coarse_mixer_init(coarse_mixer_t *mixer, float freq_error, short *sine_table_ptr) {
-    mixer->sine_lut = sine_table_ptr;
+	mixer->sine_lut = sine_table_ptr;
     mixer->phase_acc = 0;
+
+#if (COARSE_WIDTH==16)
     uint16_t FTW = (unsigned short)((freq_error * 65536.0f) / 8000.0f);
-    printf ("Coarse Mixer FTW: %u\n", FTW);
 
     // Переводим частоту коррекции в шаг DDS FTW
     mixer->phase_inc = FTW;
+#else
+
+    // В какую сторону вращать спектр:
+    // Если сигнал уплыл вверх (freq_error > 0), гетеродин должен крутить вниз (-freq_error)
+    float target_freq = freq_error;
+    // Расчет 32-битного шага фазы. Константа = (2^32 / 8000) = 536870.912
+    mixer->phase_inc = (uint32_t)((double)target_freq * 536870.912);
+#endif
+    printf ("Coarse Mixer FTW: %u\n", mixer->phase_inc);
 }
 
 void coarse_mixer_process(coarse_mixer_t *mixer, const cplx_f32 *in_sample, cplx_f32 *out_sample) {
+#if (COARSE_WIDTH==16)
     unsigned char sin_idx = (unsigned char)(mixer->phase_acc >> 8);
     unsigned char cos_idx = (unsigned char)((sin_idx + 64) & 0xFF);
 
@@ -223,6 +276,22 @@ void coarse_mixer_process(coarse_mixer_t *mixer, const cplx_f32 *in_sample, cplx
     out_sample->im = in_sample->im * c - in_sample->re * s;
 
     mixer->phase_acc = (unsigned short)(mixer->phase_acc + mixer->phase_inc);
+#else
+    // Извлекаем старшие 8 бит 32-битного аккумулятора фазы для индексации таблицы (256 элементов)
+    unsigned char sin_idx = (unsigned char)(mixer->phase_acc >> 24);
+    unsigned char cos_idx = (unsigned char)((sin_idx + 64) & 0xFF);
+
+    // Нормализация амплитуды таблицы под float (32000.0f или 32767.0f в зависимости от генерации таблиц)
+    float c = (float)mixer->sine_lut[cos_idx] / 32767.0f;
+    float s = (float)mixer->sine_lut[sin_idx] / 32767.0f;
+
+    // Комплексное перемножение
+    out_sample->re = in_sample->re * c + in_sample->im * s;
+    out_sample->im = in_sample->im * c - in_sample->re * s;
+
+    // Плавный инкремент 32-битной фазы без ручного приведения типов
+    mixer->phase_acc += mixer->phase_inc;
+#endif
 }
 
 // Коэффициенты нормированы (в формате float для модели, легко переводятся в Q15 для CH32V307)

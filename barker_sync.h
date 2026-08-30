@@ -10,13 +10,22 @@ typedef struct {
     int sample_counter;          // Счетчик отсчетов внутри одного символа (0..799)
 } barker_sync_t;
 
+// Классический код Баркера-11: 1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1
+#define BARKER_DIFF_STEPS 10 // У нас теперь 11 символов, значит 10 дифференциальных переходов
+#define BARKER_HIST_SIZE 4800 // Расширяем буфер до 6 символов
 typedef struct {
     cplx_f32 symbol_history[6]; // Кольцевой буфер для 6 последних принятых символов
     cplx_f32 template_barker[6]; // Шаблон идеальных комплексных секторов Баркера
     // Элементы скользящего CIC-интегратора на 800 отсчетов
     cplx_f32 delay_line[800];     // Линия задержки для «вычитания» старого отсчета
+    cplx_f32 diff_delay_line[800];
+    int diff_delay_idx;
     cplx_f32 running_sum;         // Текущая бегущая сумма интегратора
     int delay_idx;                // Индекс кольцевого буфера линии задержки
+    int sample_cnt;
+
+    cplx_f32 macro_history[BARKER_DIFF_STEPS]; // Буфер прошлых выходов CIC
+    int macro_sample_cnt;
 } barker_sliding_t;
 
 /*
@@ -35,7 +44,8 @@ void barker_sync_init(barker_sync_t *sync);
 // Возвращает 1, если обнаружен пик Баркера (засечка времени), иначе 0
 int barker_sync_tick(barker_sync_t *sync, const cplx_f32 *pll_output_sample, float *out_corr_power);
 
-int barker_sliding_tick(barker_sliding_t *sync, const cplx_f32 *pll_output_sample, float *out_corr_power);
+//int barker_sliding_tick(barker_sliding_t *sync, const cplx_f32 *pll_output_sample, float *out_corr_power);
+int barker_sliding_tick(barker_sliding_t *sync, const cplx_f32 *pll_output_sample, float *out_corr_power, int b_step);
 void barker_sliding_init(barker_sliding_t *sync);
 
 #endif // BARKER_SYNC_H
