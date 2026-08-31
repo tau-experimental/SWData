@@ -34,6 +34,8 @@ cplx_f32 cplx_conj(cplx_f32 in);
 
 /* Квадрат модуля (мощность): out = re^2 + im^2 */
 float cplx_mag_sq(cplx_f32 in);
+/* фаза */
+float cplx_phase(cplx_f32 in);
 
 /* Модуль (амплитуда): out = sqrt(re^2 + im^2) */
 /* Использует аппаратный корень на ПК и аппаратный fsqrt.s на CH32V307 */

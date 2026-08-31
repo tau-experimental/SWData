@@ -47,6 +47,11 @@ float cplx_mag_sq(cplx_f32 in) {
     return (in.re * in.re) + (in.im * in.im);
 }
 
+float cplx_phase(cplx_f32 in) {
+    return atan2(in.im, in.re);
+}
+
+
 float cplx_mag(cplx_f32 in) {
     return sqrtf((in.re * in.re) + (in.im * in.im));
 }

@@ -21,18 +21,20 @@ void dqpsk_modulator_init(dqpsk_modulator_t *mod, unsigned int carrier_freq, uns
 }
 
 // Вызывается внутри прерывания таймера 8 кГц
-void dqpsk_synth_tick(dqpsk_modulator_t *mod, unsigned short phase_shift, short *out_i, short *out_q) {
-    // 1. Складываем фазовую поправку, FTW и аккумулятор.
-    // Переполнение 16-битного unsigned short делает всю тригонометрическую редукцию за нас!
-    mod->phase_acc = (unsigned short)(mod->phase_acc + phase_shift + mod->phase_inc);
+void dqpsk_synth_tick(dqpsk_modulator_t *mod, unsigned short symbol_phase, short *out_i, short *out_q) {
+    // 1. Частотный аккумулятор накапливает ТОЛЬКО чистую несущую (FTW)
+    mod->phase_acc = (unsigned short)(mod->phase_acc + mod->phase_inc);
 
-    // 2. Превращаем фазовый угол в два индекса таблицы (обрезаем до 8 бит)
-    unsigned char sin_idx = (unsigned char)(mod->phase_acc >> 8);
-    unsigned char cos_idx = (unsigned char)((sin_idx + 64) & 0xFF); // Сдвиг на 90 градусов для Косинуса (I)
+    // 2. Полная фаза для таблицы синусов — это сумма частотного аккумулятора
+    // и ТЕКУЩЕЙ абсолютной фазы символа
+    unsigned short total_phase = (unsigned short)(mod->phase_acc + symbol_phase);
 
-    // 3. Извлекаем пару выборок и отдаем наружу в ЦАП/Кодек
-    *out_i = mod->sine_lut[cos_idx]; // I = Cosine
-    *out_q = mod->sine_lut[sin_idx]; // Q = Sine
+    // 3. Извлекаем индексы из полной фазы
+    unsigned char sin_idx = (unsigned char)(total_phase >> 8);
+    unsigned char cos_idx = (unsigned char)((sin_idx + 64) & 0xFF);
+
+    *out_i = mod->sine_lut[cos_idx];
+    *out_q = mod->sine_lut[sin_idx];
 }
 
 void dqpsk_modulate_packet_v3(dqpsk_modulator_t *mod, const unsigned char *in_bits, wav_stream_t *wav_out) {

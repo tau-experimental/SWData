@@ -12,31 +12,52 @@
 #include "barker_sync.h"
 #include "rx.h"
 #include "costas_loop.h"
+#include "mls_sync.h"
+#include "clk_detect.h"
+#include "schmidl_cox.h"
 
 int main(void) {
     srand((unsigned int)time(NULL));
     //printf("=== ГЕНЕРАЦИЯ ПОЛНОГО ЭФИРНОГО ПАКЕТА С ТИШИНОЙ И ПРЕАМБУЛОЙ ===\n\n");
     printf("=== ГЕНЕРАЦИЯ ТЕСТОВОГО ПАКЕТА С ТИШИНОЙ, ПРЕАМБУЛОЙ И БЕЗ ДАННЫХ ВООБЩЕ (для теста коррелятора) ===\n\n");
     int pilot_samples=8000;
+    int mls31_start_samples = 31*800;
+    int synchrodummy = 800;
 
     viterbi_init_tables();
     dqpsk_modulator_t modulator;
     dqpsk_modulator_init(&modulator, 1000, 8000);
 
     qshort_channel_sim_t channel;
-    channel_sim_init(&channel, 0.0, +0.0, 8000.0);
+    channel_sim_init(&channel, -3.0, 1.0, 8000.0);
 
     // Генерируем рандомную длительность тишины (в отсчетах ЦАП при 8000 Гц)
-    // 0.3..0.5 сек -> от 2400 до 4000 отсчетов
-    int quiet_start_samples = 2400 + (rand() % (4000 - 2400 + 1));
+    // от 2000 до 6000 отсчетов
+    int quiet_start_samples = 2000 + (rand() % (6000 - 2000 + 1));
     int quiet_end_samples   = 2400 + (rand() % (4000 - 2400 + 1));
 
+    uint32_t total = 0;
+    uint32_t preamble_end_sample;
     printf("[ПЛАН ПАКЕТА] Конец тишины: %d отсчетов (~%.3f с)\n", quiet_start_samples, (float)quiet_start_samples/8000.0f);
+    total += quiet_start_samples;
     printf("              Пилот-тон:    %d отсчетов (%5.3f с)\n", pilot_samples, pilot_samples/8000.0);
-    printf("              Баркер-код:   8800 отсчетов (11 символов BPSK, 1.100 с)\n");
-    printf("              (начало и конец):   %u и %u отсчетов\n", pilot_samples+quiet_start_samples,  pilot_samples+quiet_start_samples+8800);
+    total += pilot_samples;
+
+    printf("              Синхропустышка:    %d отсчетов (%5.3f с)\n", synchrodummy, synchrodummy/8000.0);
+    total += synchrodummy;
+
+    printf("              MLS-31:   %u отсчетов (31 символ BPSK, ~%.3f с)\n", mls31_start_samples, (float)mls31_start_samples/8000.0f);
+    total += mls31_start_samples;
+    preamble_end_sample = total;
+    printf("              (начало и конец):   %u и %u отсчетов\n", pilot_samples+quiet_start_samples,  pilot_samples+quiet_start_samples+mls31_start_samples);
     //printf("              Данные:       336000 отсчетов (420 символов, 42.000 с)\n");
-    printf("              Конец тишины: %d отсчетов (~%.3f с)\n\n", quiet_end_samples, (float)quiet_end_samples/8000.0f);
+    //
+    printf("              Пилот-тон:    %d отсчетов (%5.3f с)\n", pilot_samples, pilot_samples/8000.0);
+    total += pilot_samples;
+    printf("              Конец тишины: %d отсчетов (~%.3f с)\n", quiet_end_samples, (float)quiet_end_samples/8000.0f);
+    total += quiet_end_samples;
+
+    printf("              Всего: %u отсчетов (~%.3f с)\n\n", total, (float)total/8000.0f);
 
     // Подготовка случайных инфо-данных пакета
     static unsigned char tx_payload_bits[840];
@@ -74,26 +95,52 @@ int main(void) {
         channel_sim_process(&channel, &clean_sample, &corrupted_sample);
         wav_write_sample(&wav_rx, &corrupted_sample);
     }
+    // --- ЭТАП 3.1: генерация синхро-пустышки (просто один шаг фазы на +45)
+    unsigned short current_absolute_synchodummy_phase = 57344; // фааза синхропустышки
+    for (int s = 0; s < 800; s++) {
+        short raw_i, raw_q;
 
-    // --- ЭТАП 3: Преамбула Баркера (11 DBPSK-символов) ---
+        // Передаем ТЕКУЩУЮ СТАБИЛЬНУЮ ФАЗУ символа на протяжении всех 800 сэмплов!
+        dqpsk_synth_tick(&modulator, current_absolute_synchodummy_phase, &raw_i, &raw_q);
+
+        clean_sample.re = (float)raw_i / 32000.0f;
+        clean_sample.im = (float)raw_q / 32000.0f;
+
+        channel_sim_process(&channel, &clean_sample, &corrupted_sample);
+        wav_write_sample(&wav_rx, &corrupted_sample);
+    }
+
+    // --- ЭТАП 3.2: Преамбула Баркера (11 DBPSK-символов) ---
     // Используем классический код Баркера-11: 1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1
     // Классический код Баркера-11 (абсолютные знаки): 1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1
-    int barker_signs[11] = {1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1};
+    // int barker_signs[11] = {1, 1, 1, -1, -1, -1, 1, -1, -1, 1, -1};
+    // 1. Массив знаков MLS-31 (вычислен через полином x^5 + x^2 + 1)
+    // Содержит ровно 31 элемент (15 единиц и 16 минус единиц — идеальный баланс)
+#define SIGNATURE_LENGTH	31
+    const int mls_31_signs[SIGNATURE_LENGTH] = {
+        1,  1,  1,  1,  1, -1, -1,  1,  1, -1,
+        1, -1,  1,  1,  1, -1,  1, -1, -1, -1,
+        1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1
+    };
+    // 2. Код передатчика в Вашей модели симулятора
+    printf("[ПЕРЕДАТЧИК] Генерация честной кумулятивной DBPSK...\n");
 
-    // Стартовая фаза преамбулы (пусть будет 0)
-    unsigned short accumulated_tx_phase = 0;
-    printf("[ПЕРЕДАТЧИК] Каноническая генерация DBPSK Баркер-11...\n");
+    unsigned short current_absolute_phase = current_absolute_synchodummy_phase; // фааза синхропустышки
+    unsigned short phase_step;
 
-    for (int sym = 0; sym < 11; sym++) {
-        // Если +1 -> шаг +45 градусов (8192). Если -1 -> шаг -45 градусов (57344)
-        unsigned short phase_shift = (barker_signs[sym] == 1) ? 8192 : 57344;
+    for (int sym = 0; sym < SIGNATURE_LENGTH; sym++) {
+        // Вычисляем дельту для текущего шага
+        phase_step = (mls_31_signs[sym] == 1) ? 8192 : 57344;
+
+        // Кумулятивно накапливаем абсолютную фазу символа
+        current_absolute_phase = (unsigned short)(current_absolute_phase + phase_step);
 
         for (int s = 0; s < 800; s++) {
             short raw_i, raw_q;
-            // Сдвиг вносим СТРОГО в первом сэмпле нового символа
-            unsigned short current_shift = (s == 0) ? phase_shift : 0;
 
-            dqpsk_synth_tick(&modulator, current_shift, &raw_i, &raw_q);
+            // Передаем ТЕКУЩУЮ СТАБИЛЬНУЮ ФАЗУ символа на протяжении всех 800 сэмплов!
+            dqpsk_synth_tick(&modulator, current_absolute_phase, &raw_i, &raw_q);
+
             clean_sample.re = (float)raw_i / 32000.0f;
             clean_sample.im = (float)raw_q / 32000.0f;
 
@@ -103,10 +150,9 @@ int main(void) {
     }
 
     // --- ПОВТОРЕНИЕ ЭТАПА 2: Пилот-тон (Чистая несущая 1000 Гц без модуляции) ---
-    // Чтобы не было фазового скачка, берем фазовую поправку = 0
     for (int i = 0; i < pilot_samples; i++) {
         short raw_i, raw_q;
-        dqpsk_synth_tick(&modulator, 0, &raw_i, &raw_q);
+        dqpsk_synth_tick(&modulator, current_absolute_phase, &raw_i, &raw_q); // остаёмся на той фазе, где остановились при передаче преамбулы
         clean_sample.re = (float)raw_i / 32000.0f;
         clean_sample.im = (float)raw_q / 32000.0f;
 
@@ -141,6 +187,7 @@ int main(void) {
 
     wav_close(&wav_rx);
     printf("🎉 СИГНАЛ ЗАПИСАН В 'rx_packet_full.wav'. Тракт передачи полностью готов к приему.\n");
+
     //--------------------------------- ПРИЁМ
     // Verification snippet to evaluate Pilot Tone detection under SNR = 6dB
 
@@ -174,13 +221,15 @@ int main(void) {
     typedef enum {
         SEARCHING_PILOT,
         EXTRACTING_CANDY,
-		EXTRACTING_DEBUG_BARKER
+		SEARCHING_PREAMBLE,
+		MEASURING_NEEDLE,
+		GARBLING
     } test_mode_t;
 
-    test_mode_t mode = EXTRACTING_DEBUG_BARKER;//SEARCHING_PILOT;
+    test_mode_t mode = SEARCHING_PREAMBLE;//SEARCHING_PILOT;
     float detected_freq_error = 0.0f;
 	FILE *csv = fopen ("spectrum.csv", "wt");
-	FILE *barker_csv = fopen ("barker.csv", "wt");
+	FILE *mls31_csv = fopen ("mls31.csv", "wt");
 	//fprintf (csv, "Sample,Correlation,NoiseFloor\n");
     fft_init_tables();
     int got_barker=0;
@@ -191,61 +240,81 @@ int main(void) {
     float ultimate_max_power = 0.0f;
     int ultimate_max_step = 0;
 
+    //clk_detect_t clk_sync;
+    //clk_detect_init(&clk_sync);
+
+    //schmidl_cox_t sc_sync;
+    //sc_init(&sc_sync);
+
+    mls_sync_t mls_sync;
+    mls_init(&mls_sync);
+
+	#define NEEDLE_THRESHOLD 0.50f
+	#define CONST_GROUP_DELAY 50 // Наша расчетная задержка дециматора
+
+	static int t_start = 0;
+	static int t_stop = 0;
+
     while (wav_read_sample(&wav_in, &rx_sample) == 1) {
     	/*
     	1) check_spectrum_for_pilot
     	2) coarse_mixer_process
     	3) fir_filter_process
     	*/
-    	if (mode == EXTRACTING_DEBUG_BARKER) {
-            float barker_corr_power = 0.0f;
-            // В момент перехода из БПФ в поиск Баркера принудительно обнуляем счетчики,
-			// чтобы сетка 800 сэмплов коррелятора идеально совпала с физическим началом Баркера!
-            /*if (b_step == (pilot_samples + quiet_start_samples)) {
-				printf ("Сэмпл %u, взводим Баркера\n", b_step);
-				barker_slider.sample_cnt = 0;
-				barker_slider.delay_idx = 0;
-				memset(&barker_slider.running_sum, 0, sizeof(barker_slider.running_sum));
-			}*/
+    	float needle_val = 0.0f;
+    	float sc_power = 0.0f;
+    	int is_synchronised = mls_tick(&mls_sync, &rx_sample, &needle_val, &sc_power);
+    	fprintf(mls31_csv, "%d, %.4f, %.4f, %.4f\n", b_step, mls_sync.spy, needle_val, cplx_phase(mls_sync.derot)/3.1415);
 
-            barker_sliding_tick(&barker_slider, &rx_sample, &barker_corr_power, b_step);
+    	if (mode == SEARCHING_PREAMBLE) {
+    		//float sc_power = 0.0f;
+			//cplx_f32 sc_complex = {0.0f, 0.0f};
 
-            if (!barker_lock_triggered) {
-                // Боевой порог 0.84 гарантированно выше бокового лепестка (0.825)!
-                if (barker_corr_power >= 0.84f) {
-                    barker_lock_triggered = 1;
-                    window_counter = 0; // Запускаем таймер окна на 1 символ вперед
-                    ultimate_max_power = barker_corr_power;
-                    ultimate_max_step = b_step;
-                }
-            } else {
-                // Мы внутри защищенного строб-окна главного купола (длительность 1 символ)
-                if (barker_corr_power > ultimate_max_power) {
-                    ultimate_max_power = barker_corr_power;
-                    ultimate_max_step = b_step; // Непрерывно обновляем абсолютную вершину
-                }
+    		//sc_tick(&sc_sync, &rx_sample, &sc_power, &sc_complex);
 
-                window_counter++;
-                if (window_counter >= 800) {
-                    // Окно закрылось! Мы гарантированно поймали вершину и переждали все провалы
-                    printf("🎯 🎯 🎯 [BARKER SYNC LOCK!] Временная сетка кадра успешно зафиксирована!\n");
-                    printf("  -> Истинный пик кадра на отсчете: %d\n", ultimate_max_step);
-                    printf("  -> Максимальная мощность: %.4f\n\n", ultimate_max_power);
+			// Пишем лог: отсчет, нормированная мощность, вещественная часть узора
+    	    // Функция возвращает 1 строго в момент идеальной тактовой засечки!
 
-                    barker_lock_triggered = 0; // Сброс триггера для следующего пакета
 
-                    // Переходим в режим приема данных. Физический конец Баркера на 20276.
-                    // Зная точный b_step вершины (например, 20002), выставляем строгую
-                    // границу начала первого информационного символа:
-                    int data_start_step = ultimate_max_step + (20276 - 20000);
-                    printf ("Модельный data_start_step (внимание, костыль!!!): %u\n", data_start_step);
-                    got_barker = 1;
-                    break;
-                }
+			if (b_step == 8000) { /* тупая симуляция захвата частоты Костасом посреди пилот-тона */
+				mls_sync.is_calibrated = 1;
+				mls_sync.calibre.re = mls_sync.running_sum.re;
+				mls_sync.calibre.im = mls_sync.running_sum.im;
+			};
+
+	        if (needle_val > NEEDLE_THRESHOLD) {
+	            t_start = b_step; // Запомнили точку входа на склон
+	            mode = MEASURING_NEEDLE;
+	        }
+
+			// Пишем лог: b_step, мощность Шмидля-Кокса, и ИГЛА второй ступени
+			//fprintf(mls31_csv, "%d, %.4f, %.4f\n", b_step, sc_power, mls_needle);
+			//fprintf(mls31_csv, "%d, %.4f, %.4f\n", b_step, sc_power, 180.0*cplx_phase(mls_sync.derot)/3.1415);
+
+            //wav_write_sample(&wav_out, &rx_sample);
+    	} else if (mode == MEASURING_NEEDLE) {
+            if (needle_val < NEEDLE_THRESHOLD) {
+                t_stop = b_step; // Запомнили точку выхода со склона
+
+                // Вычисляем геометрический центр купола
+                int center_of_dome = (t_start + t_stop) / 2;
+
+                // Финальная привязка к сетке полезной нагрузки с учетом задержки фильтров
+                int true_viterbi_sync_point = center_of_dome - CONST_GROUP_DELAY;
+
+                printf("[СИНХРОНИЗАЦИЯ] Игла зафиксирована! Истинный конец преамбулы: %d\n", true_viterbi_sync_point);
+                printf("                Конец преамбулы в исходном сигнале (модель): %u\n", preamble_end_sample);
+
+                // Вычисляем точную погрешность относительно ожидаемого значения симулятора
+                int error = true_viterbi_sync_point - preamble_end_sample;
+                printf("[СИНХРОНИЗАЦИЯ] Погрешность системы: %d сэмплов\n", error);
+
+                // Сбрасываем тактовый генератор символов Витерби в 0 и погнали принимать данные!
+                //symbol_sample_counter = 0;
+                mode = GARBLING;
             }
-
-            wav_write_sample(&wav_out, &rx_sample);
-            if ((b_step%50 == 0)) { fprintf(barker_csv, "%d, %.2f\n", b_step, barker_corr_power); }
+    	} else if (mode == GARBLING)  {
+    		/* just do nothing till end of input file */
     	} else if (mode == SEARCHING_PILOT) {
 			// Переводим float в честный Q14 (масштаб 16384.0f), чтобы компенсировать внутренний сдвиг БПФ
 	    	fft_incoming_i[sample_idx] = (int16_t)(rx_sample.re * 8192);//16384.0f);
@@ -343,9 +412,10 @@ int main(void) {
 		}
 		b_step++;
 	}
-    printf ("Тест RX-конвейера завершён, сигнатура Баркера %s\n", (got_barker == 1)?"НАЙДЕНА!" : "не обнаружена. Провал!");
+    ///printf ("Тест RX-конвейера завершён, сигнатура Баркера %s\n", (got_barker == 1)?"НАЙДЕНА!" : "не обнаружена. Провал!");
+    printf ("Тест RX-конвейера завершён\n");
 	fclose(csv);
-	fclose(barker_csv);
+	fclose(mls31_csv);
     wav_close(&wav_in);
     wav_close(&wav_out);
 
