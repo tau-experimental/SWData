@@ -21,12 +21,12 @@ unset xtics
 unset xlabel
 set title "Наладка S/C sync" offset 0,-0.5 
 set ylabel "SC power"
-set yrange [-1500:1500]
+set yrange [-1:2]
 set ytics
 
 set key top right
 
-plot "mls31.csv" using 1:2 with lines lw 2 lt rgb "#FF007F" title "SC power"
+plot "mls31.csv" using 1:2 with lines lw 2 lt rgb "#FF007F" title "Is synchronized?"
 
 # --- НИЖНЯЯ ПАНЕЛЬ (Величина 2) ---
 set tmargin screen 0.50  
@@ -37,7 +37,7 @@ set xlabel "Время (Сэмплы)"
 unset title
 
 set ylabel "Needle"
-set yrange [-1.2:1.2]
+set yrange [-200:200]
 set ytics
 
 plot "mls31.csv" using 1:3 with lines lw 2 lt rgb "#FF7F00" title "MLS Needle" , \

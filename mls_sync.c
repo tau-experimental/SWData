@@ -1,68 +1,60 @@
 #include "mls_sync.h"
 #include <string.h>
+#include <math.h>
 
 // Канонический массив знаков MLS-31
-static const int8_t mls_31_signs[31] = {
-    1,  1,  1,  1,  1, -1, -1,  1,  1, -1,
-    1, -1,  1,  1,  1, -1,  1, -1, -1, -1,
-    1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1
+// Жесткий системный шаблон знаков М-последовательности MLS-31
+// (Замените этот массив на ваши реальные 31 знаков из проекта, если они отличаются)
+const int8_t mls_31_signs[MLS_LEN] = {
+    //1, 1, 1, 1, 1, -1, -1, -1, 1, 1, -1, 1, -1, -1, 1, -1,
+    //1, 1, -1, -1, -1, -1, 1, -1, 1, -1, 1, 1, 1, -1, -1
+		1,  1,  1,  1,  1, -1, -1,  1,  1, -1,
+		1, -1,  1,  1,  1, -1,  1, -1, -1, -1,
+		1, -1, -1,  1, -1,  1, -1,  1, -1, -1, -1
 };
 
+/**
+ * @brief Инициализация структуры синхронизатора.
+ * Исправлен баг неявного приведения float->int8_t в шаблоне.
+ */
 void mls_init(mls_sync_t *sync) {
-	memset (sync, 0, sizeof(mls_sync_t));
-	// Сброс первой ступени
-	sync->ptr = 0;
-    sync->running_sum.re = 0.0f;
-    sync->running_sum.im = 0.0f;
-    sync->energy_b = 0.0f;
-    memset(sync->delay_line, 0, sizeof(sync->delay_line));
+    // Полная очистка памяти структуры (все буферы в 0)
+    memset(sync, 0, sizeof(mls_sync_t));
 
-    // Сброс второй ступени
-    sync->macro_ptr = 0;
-    sync->decimation_accumulator = 0.0f;
-    sync->decimation_counter = 0;
-    memset(sync->macro_vector_history, 0, sizeof(sync->macro_vector_history));
-    memset(sync->angle_trace_history, 0, sizeof(sync->angle_trace_history));
+    // Сброс ищейки знака-пустышки
+    sync->clk_smooth_min = 0.0f;
+    sync->clk_min_hold_counter = 0;
+    sync->clk_smooth_ptr = 0;
+    sync->clk_smooth_sum = 0.0f;
+    sync->prev_symbol_needle = 0.0f;
 
-#if 0
-    // Заполнение растянутого шаблона: каждый знак MLS повторяется 8 раз подряд
-    for (int i = 0; i < MLS_LEN; i++) {
-        for (int j = 0; j < POINTS_PER_SYMBOL; j++) {
-            int idx = i * POINTS_PER_SYMBOL + j;
-            sync->template_mls_stretched[idx] = mls_31_signs[i];
-        }
-    }
-#else
-    // Шаблон со скошенными фронтами для одного символа из 8 точек децимации:
-    // Вместо [1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0, 1.0]
-    // Мы делаем плавный набег фазы:
-    //const float triangle_profile[8] = {0.25f, 0.5f, 0.75f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
-
-    const float triangle_profile[8] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f}; // прямоугольный профиль шаблона
+    // Генерация растянутого прямоугольного шаблона знаков MLS-31
+    // Используем чистые целочисленные 1 и -1 для экономии памяти в int8_t
     for (int i = 0; i < MLS_LEN; i++) {
         int8_t current_sign = mls_31_signs[i];
-        int8_t prev_sign = (i == 0) ? -1 : mls_31_signs[i - 1]; // учитываем нашу отрицательную пустышку!
+        // Учитываем отрицательную пустышку перед началом последовательности
+        int8_t prev_sign = (i == 0) ? -1 : mls_31_signs[i - 1];
 
         for (int j = 0; j < POINTS_PER_SYMBOL; j++) {
             int idx = i * POINTS_PER_SYMBOL + j;
 
             if (current_sign != prev_sign) {
-                // Если на этом символе произошел излом фазы, используем плавный профиль
-                if (current_sign > 0) {
-                    sync->template_mls_stretched[idx] = triangle_profile[j];
-                } else {
-                    sync->template_mls_stretched[idx] = -triangle_profile[j];
-                }
+                // Граница излома фазы (при прямоугольном профиле — жесткая полка)
+                sync->template_mls_stretched[idx] = (current_sign > 0) ? 1 : -1;
             } else {
-                // Если фаза продолжает лежать на полке (знак не изменился)
-                sync->template_mls_stretched[idx] = (current_sign > 0) ? 1.0f : -1.0f;
+                // Фаза продолжает лежать на полке
+                sync->template_mls_stretched[idx] = (current_sign > 0) ? 1 : -1;
             }
         }
     }
-#endif
+
     sync->is_calibrated = 0;
+    sync->spy = 0.0f;
 }
 
+
+#if 0
+// рабочая, но не совсем точная функция
 int mls_tick(mls_sync_t *sync, const cplx_f32 *input_sample, float *out_mls_needle, float *out_sc_power) {
     // По умолчанию игла равна нулю, пока не сработает окно децимации
     *out_mls_needle = 0.0f;
@@ -156,65 +148,19 @@ int mls_tick(mls_sync_t *sync, const cplx_f32 *input_sample, float *out_mls_need
 	        break;
 
 	    case CLK_CATCH_SYNC_SYMBOL:
-#if 0
-	        // Холостой символ пошел вверх. Ищем абсолютный максимум на каждом сэмпле.
-	        // Берем порог с запасом (например, > 0.15 в радианах), чтобы отсечь шум
-	        if (soft_angle_decision > 0.15f) {
-	            if (soft_angle_decision > sync_symbol_max) {
-	                sync_symbol_max = soft_angle_decision;
-	                max_hold_counter = 0; // Сбрасываем счетчик удержания пика
-	            } else {
-	                // Если фаза перестала расти и начала падать (прошли вершину),
-	                // или держится на плато. Ждем стабильного спада, например, 5-10 сэмплов,
-	                // чтобы защититься от мелкого шумового джиттера на макушке.
-	                max_hold_counter++;
-	                if (max_hold_counter > 8) {
-	                    // ВЕРШИНА ПОЙМАНА! Физическая граница символов найдена.
-	                    // Накатываем коррекцию назад на величину удержания пика (8 сэмплов)
-	                    // и принудительно защелкиваем децимирующий счетчик в идеальный ноль!
-	                    sync->decimation_counter = 8;
-	                    sync->macro_ptr = 0; // Сбрасываем макро-историю
-
-	                    clk_state = CLK_RUNNING_DECIMATOR; // Запускаем ищейку MLS
-	                }
-	            }
-	        }
-#else
 	        // 1. Скользящий CIC-интегратор сглаживания фазового трека
 	        static int low_phase_duration_cnt = 0;
 	        float outgoing_phase = sync->clk_smooth_buffer[sync->clk_smooth_ptr];
+	        sync->clk_smooth_buffer[sync->clk_smooth_ptr] = soft_angle_decision;
+	        sync->clk_smooth_ptr = (sync->clk_smooth_ptr + 1) % DECLK_WINDOW;
 	        sync->clk_smooth_sum += (soft_angle_decision - outgoing_phase);
 
 	        // ЛОГИКА ЗАЩИТЫ: Игнорируем всё, пока фаза не пошла на реальный штурм вниз!
 	        // Пока soft_angle_decision болтается около нуля в шумах пилота, компаратор закрыт.
 	        sync->spy = sync->clk_smooth_sum;
 
-#if 0
-	        if (soft_angle_decision < -0.30f) {
-	            // Включаем пиковый детектор площади только внутри истинного треугольника пустышки
-	            if (sync->clk_smooth_sum < sync->clk_smooth_min) {
-	                sync->clk_smooth_min = sync->clk_smooth_sum;
-	                sync->clk_min_hold_counter = 0;
-	            } else {
-	                // Фаза пошла вверх к нулю — мы прошли реальное дно холостого символа!
-	                sync->clk_min_hold_counter++;
-
-	                if (sync->clk_min_hold_counter > 16) {
-	                    // ТАКТОВАЯ СЕТКА ЗАЩЕЛКНУТА СВЕРХНАДЕЖНО!
-	                    sync->decimation_counter = 100 + 16;
-	                    sync->macro_ptr = 0;
-
-	                    // Записываем маркер отладки для шпиона:
-	                    // пускай малиновая линия станет равна 1.0 строго в момент ИСТИННОЙ сработки
-	                    sync->spy = 1.0f;
-
-	                    clk_state = CLK_RUNNING_DECIMATOR;
-	                    //printf("[CLK] Истинный тактовый замок защелкнут на отсчете %d\n", b_step);
-	                }
-	            }
-	        }
-#else
-	        if (soft_angle_decision < -0.20f) {
+	        //if (soft_angle_decision < -0.20f) {
+	        if (sync->clk_smooth_sum < -0.20f) {
 	            low_phase_duration_cnt++;
 
 	            // Включаем алгоритм поиска минимума площади ТОЛЬКО если фаза
@@ -244,8 +190,6 @@ int mls_tick(mls_sync_t *sync, const cplx_f32 *input_sample, float *out_mls_need
 	            // Если фаза выскочила обратно выше -0.2, сбрасываем счетчик длительности
 	            low_phase_duration_cnt = 0;
 	        }
-#endif
-#endif
 	        break;
 
 	    case CLK_RUNNING_DECIMATOR:
@@ -300,13 +244,6 @@ int mls_tick(mls_sync_t *sync, const cplx_f32 *input_sample, float *out_mls_need
 	    	    *out_mls_needle = 0.0f;
 	    	}
 
-	    	//sync->spy = *out_mls_needle;
-	    	/*static float needle_max = 0;
-
-	    	if (sync->spy > 0.5) {
-	    		if (sync->spy > needle_max) needle_max = sync->spy;
-	    		if (sync->spy < needle_max) return 1; // тупейший детектор максимума
-	    	}*/
 	        break;
 	}
 
@@ -318,3 +255,236 @@ int mls_tick(mls_sync_t *sync, const cplx_f32 *input_sample, float *out_mls_need
 
 	return 0;
 }
+#else
+
+int mls_tick(mls_sync_t *sync, const cplx_f32 *input_sample, float *out_mls_needle, float *out_sc_power) {
+    *out_mls_needle = 0.0f;
+    *out_sc_power = 0.0f;
+    int is_needle_found = 0;
+
+    static clk_grid_state_t clk_state = CLK_WAIT_PILOT_STABLE;
+    static int low_phase_duration_cnt = 0;
+
+    // =========================================================================
+    // СТУПЕНЬ 1: Скользящее когерентное окно Шмидля-Кокса (800 сэмплов)
+    // =========================================================================
+    cplx_f32 old_sample = sync->delay_line[sync->ptr];
+    int mid_idx = (sync->ptr + SC_HALF_LEN) % SAMPLES_PER_SYMBOL;
+    cplx_f32 mid_sample = sync->delay_line[mid_idx];
+
+    sync->delay_line[sync->ptr] = *input_sample;
+
+    // Вычисляем через вашу библиотечную функцию умножения на сопряженное
+    cplx_f32 term_new = cplx_mul_conj(mid_sample, *input_sample);
+    cplx_f32 term_old = cplx_mul_conj(old_sample, mid_sample);
+
+    sync->running_sum.re += term_new.re - term_old.re;
+    sync->running_sum.im += term_new.im - term_old.im;
+
+    float pwr_new = input_sample->re * input_sample->re + input_sample->im * input_sample->im;
+    float pwr_old = mid_sample.re * mid_sample.re + mid_sample.im * mid_sample.im;
+    sync->energy_b += pwr_new - pwr_old;
+
+    float sc_power_num = sync->running_sum.re * sync->running_sum.re + sync->running_sum.im * sync->running_sum.im;
+    float sc_denom = sync->energy_b * sync->energy_b;
+    float current_sc_power = (sc_denom > 1e-6f) ? (sc_power_num / sc_denom) : 0.0f;
+
+    sync->ptr = (sync->ptr + 1) % SAMPLES_PER_SYMBOL;
+
+    // =========================================================================
+    // СТУПЕНЬ 2: Вычисление фазы через деротатор (внешнее управление Костаса)
+    // =========================================================================
+    float soft_angle_decision = 0.0f;
+
+    if (sync->is_calibrated) {
+        // Программный доворот с правильной полярностью мнимой части
+        sync->derot.re = sync->running_sum.re * sync->calibre.re + sync->running_sum.im * sync->calibre.im;
+        sync->derot.im = sync->running_sum.re * sync->calibre.im - sync->running_sum.im * sync->calibre.re;
+
+        if (sync->derot.re > 100.0f) {
+            soft_angle_decision = sync->derot.im / sync->derot.re;
+        }
+
+        // Выводим трек фазы шпиону (теперь пустышка обязана смотреть вниз!)
+        sync->spy = soft_angle_decision;
+    } else {
+        // Пока Костас не защелкнулся, выводим сырую мощность Шмидля-Кокса
+        *out_sc_power = current_sc_power;
+    }
+
+    // =========================================================================
+    // СТУПЕНЬ 3: Автомат тактовой сетки
+    // =========================================================================
+    switch (clk_state) {
+        case CLK_WAIT_PILOT_STABLE:
+            if (sync->is_calibrated) {
+                clk_state = CLK_CATCH_SYNC_SYMBOL;
+            }
+            break;
+
+        case CLK_CATCH_SYNC_SYMBOL:
+            // Костас на связи, но пустышку еще ждем. Фиолетовая линия = -500
+        	*out_sc_power = -500.0f;
+
+			// Наш CIC-фильтр сглаживания площади знака-пустышки
+			float outgoing_phase = sync->clk_smooth_buffer[sync->clk_smooth_ptr];
+			sync->clk_smooth_sum += (soft_angle_decision - outgoing_phase);
+			sync->clk_smooth_buffer[sync->clk_smooth_ptr] = soft_angle_decision;
+			sync->clk_smooth_ptr = (sync->clk_smooth_ptr + 1) % DECLK_WINDOW;
+
+			// === ПЕРЕХВАТ ШПИОНА ===
+			// Выводим интегральную площадь площади вместо фазы!
+			// Мы увидим плавную яму, по дну которой автомат ищет минимум.
+			sync->spy = sync->clk_smooth_sum;
+
+            // === ЖЕСТКИЙ БОЕВОЙ ПОРОГ ИНТЕГРАЛЬНОЙ ПЛОЩАДИ ===
+            // Шум пилота никогда не пробьет -100.0f градусов.
+            // Реальная пустышка гарантированно улетает до -170.
+            if (sync->clk_smooth_sum < -100.0f) {
+                low_phase_duration_cnt++;
+
+                // Ждем стабильного удержания глубокого тренда
+                if (low_phase_duration_cnt > 100) {
+                    if (sync->clk_smooth_sum < sync->clk_smooth_min) {
+                        sync->clk_smooth_min = sync->clk_smooth_sum;
+                        sync->clk_min_hold_counter = 0;
+                    } else {
+                        sync->clk_min_hold_counter++;
+
+                        // Окно фиксации прохождения дна
+                        if (sync->clk_min_hold_counter > 40) {
+                            // ЗАЩЕЛКА СИНХРОНИЗАЦИИ
+                            sync->decimation_counter = 0;
+                            sync->macro_ptr = 0;
+
+                            clk_state = CLK_RUNNING_DECIMATOR;
+                            low_phase_duration_cnt = 0;
+                        }
+                    }
+                }
+            } else {
+                low_phase_duration_cnt = 0;
+            }
+			break;
+
+        case CLK_RUNNING_DECIMATOR:
+            *out_sc_power = -1000.0f; // Удерживаем статус работы ищейки
+            sync->spy = 180*soft_angle_decision/3.1415; // Возвращаем фазу, чтобы видеть узор MLS
+
+
+            // 1. Накапливаем фазу в оба интегратора параллельно
+            sync->symbol_integrator_A += soft_angle_decision;
+
+            // Канал Б активируется со сдвигом в 400 сэмплов относительно старта А
+            if (sync->decimation_counter >= 400 || sync->channel_B_active) {
+                sync->symbol_integrator_B += soft_angle_decision;
+                sync->channel_B_active = 1; // Зафиксировали, что Б вошел в режим накопления
+            }
+
+            // Инкрементируем сквозной счетчик сэмплов внутри текущего символа
+            sync->decimation_counter++;
+
+            // Переменные для обсчета сверток
+            float needle_A = 0.0f;
+            float needle_B = 0.0f;
+
+            // =========================================================================
+            // ТОЧКА СРАБАТЫВАНИЯ КАНАЛА Б (Прошло ровно 400 сэмплов — середина символа А)
+            // =========================================================================
+            if (sync->decimation_counter == 400)
+            {
+                // Канал Б завершил накопление своего 800-сэмплового окна!
+                float soft_symbol_B = sync->symbol_integrator_B / 800.0f;
+                sync->symbol_integrator_B = 0.0f;
+
+                sync->soft_mls_buffer_B[sync->symbol_ptr_B] = soft_symbol_B;
+
+                // Считаем свертку для Канала Б
+                float corr_sum_B = 0.0f;
+                float energy_B = 0.0f;
+                int idx_B = sync->symbol_ptr_B;
+
+                for (int i = 0; i < MLS_LEN; i++) {
+                    float val = sync->soft_mls_buffer_B[idx_B];
+                    int8_t sign = mls_31_signs[MLS_LEN - 1 - i];
+                    corr_sum_B += val * (float)sign;
+                    energy_B += val * val;
+
+                    idx_B--;
+                    if (idx_B < 0) idx_B = MLS_LEN - 1;
+                }
+
+                if (energy_B > 0.01f) {
+                    needle_B = (corr_sum_B * corr_sum_B) / (energy_B * (float)MLS_LEN);
+                }
+
+                // Продвигаем указатель Канала Б
+                sync->symbol_ptr_B++;
+                if (sync->symbol_ptr_B >= MLS_LEN) sync->symbol_ptr_B = 0;
+            }
+
+            // =========================================================================
+            // ТОЧКА СРАБАТЫВАНИЯ КАНАЛА А (Прошло ровно 800 сэмплов — конец символа А)
+            // =========================================================================
+            if (sync->decimation_counter >= SAMPLES_PER_SYMBOL)
+            {
+                // Сбрасываем тактовый счетчик в ноль для следующего цикла
+                sync->decimation_counter = 0;
+
+                // Канал А завершил накопление своего 800-сэмплового окна
+                float soft_symbol_A = sync->symbol_integrator_A / 800.0f;
+                sync->symbol_integrator_A = 0.0f;
+
+                sync->soft_mls_buffer_A[sync->symbol_ptr_A] = soft_symbol_A;
+
+                // Считаем свертку для Канала А
+                float corr_sum_A = 0.0f;
+                float energy_A = 0.0f;
+                int idx_A = sync->symbol_ptr_A;
+
+                for (int i = 0; i < MLS_LEN; i++) {
+                    float val = sync->soft_mls_buffer_A[idx_A];
+                    int8_t sign = mls_31_signs[MLS_LEN - 1 - i];
+                    corr_sum_A += val * (float)sign;
+                    energy_A += val * val;
+
+                    idx_A--;
+                    if (idx_A < 0) idx_A = MLS_LEN - 1;
+                }
+
+                if (energy_A > 0.01f) {
+                    needle_A = (corr_sum_A * corr_sum_A) / (energy_A * (float)MLS_LEN);
+                }
+
+                // Продвигаем указатель Канала А
+                sync->symbol_ptr_A++;
+                if (sync->symbol_ptr_A >= MLS_LEN) sync->symbol_ptr_A = 0;
+            }
+
+            // =========================================================================
+            // ВЫБОР СИЛЬНЕЙШЕГО КАНАЛА И ВЗВОД ОБЩЕГО ТРИГГЕРА
+            // =========================================================================
+            // Отдаем наружу в main.c наибольшее значение иглы из двух каналов для графиков
+            *out_mls_needle = (needle_A > needle_B) ? needle_A : needle_B;
+
+            static int peak_latch = 0;
+
+            if (!peak_latch) {
+                // Если выстрелил Канал А (идеальная тактовая синхронизация первой ступени)
+                if (needle_A > 0.5f) {
+                    peak_latch = 1;
+                    is_needle_found = 1; // Возвращаем 1 в main.c
+                }
+                // Если первая ступень промахнулась на полсимвола, выстрелит Канал Б!
+                else if (needle_B > 0.5f) {
+                    peak_latch = 2;      // Запоминаем, что победил ортогональный Канал Б
+                    is_needle_found = 2; // Возвращаем двойку '2' как признак полусимвольного сдвига!
+                }
+            }
+            break;
+
+    }
+
+    return is_needle_found;
+}
+#endif

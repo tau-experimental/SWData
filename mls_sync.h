@@ -1,6 +1,9 @@
 #ifndef ___MLS31_SYNCHRONIZATOR__
 #define ___MLS31_SYNCHRONIZATOR__
 
+#include <stdint.h>
+#include "complex_math.h"
+
 #define MLS_LEN 31
 #define SAMPLES_PER_SYMBOL 800
 #define SC_HALF_LEN        (SAMPLES_PER_SYMBOL/2)
@@ -9,8 +12,8 @@
 #define MLS_MACRO_HISTORY_LEN (MLS_LEN * POINTS_PER_SYMBOL)         // 248 точек
 #define DECLK_WINDOW 200 // для детектора синхропустышки
 
-#include <stdint.h>
-#include "complex_math.h"
+extern const int8_t mls_31_signs[MLS_LEN];
+
 
 typedef struct {
     // === СТУПЕНЬ 1: Буферы и переменные Шмидля-Кокса ===
@@ -32,10 +35,18 @@ typedef struct {
     cplx_f32 calibre;
     cplx_f32 derot;
 
-    // === НОВАЯ ВТОРАЯ СТУПЕНЬ: Мягкий символьный интегратор ===
-    float symbol_integrator;         // Копилка фазы внутри текущего символа
-    float soft_mls_buffer[MLS_LEN];  // Буфер мягких решений на 31 символ (124 байта!)
-    int symbol_ptr;                  // Указатель головы 31-элементного буфера
+    float prev_symbol_needle; // Память иглы между символами
+
+    // === ДВУХКАНАЛЬНАЯ СИМВОЛЬНАЯ ИЩЕЙКА (Каналы А и Б со сдвигом 400 сэмплов) ===
+	float symbol_integrator_A;         // Копилка фазы Канала А
+	float soft_mls_buffer_A[MLS_LEN];  // Буфер мягких решений Канала А (31 символ)
+	int symbol_ptr_A;                  // Указатель головы Канала А
+
+	float symbol_integrator_B;         // Копилка фазы Канала Б
+	float soft_mls_buffer_B[MLS_LEN];  // Буфер мягких решений Канала Б (31 символ)
+	int symbol_ptr_B;                  // Указатель головы Канала Б
+
+	int channel_B_active;              // Флаг активации интегратора Б (через 400 сэмплов после А)
 
     /* детектор отрицательного пика синхропустышки -1 (ПЕРЕД MLS-31!) */
     float clk_smooth_buffer[DECLK_WINDOW];

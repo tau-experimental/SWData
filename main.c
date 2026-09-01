@@ -16,6 +16,8 @@
 #include "clk_detect.h"
 #include "schmidl_cox.h"
 
+#define GENERATE_DATA
+
 int main(void) {
     srand((unsigned int)time(NULL));
     //printf("=== ГЕНЕРАЦИЯ ПОЛНОГО ЭФИРНОГО ПАКЕТА С ТИШИНОЙ И ПРЕАМБУЛОЙ ===\n\n");
@@ -29,7 +31,7 @@ int main(void) {
     dqpsk_modulator_init(&modulator, 1000, 8000);
 
     qshort_channel_sim_t channel;
-    channel_sim_init(&channel, -3.0, 1.0, 8000.0);
+    channel_sim_init(&channel, 96.0, 1.0, 8000.0);
 
     // Генерируем рандомную длительность тишины (в отсчетах ЦАП при 8000 Гц)
     // от 2000 до 6000 отсчетов
@@ -49,9 +51,14 @@ int main(void) {
     printf("              MLS-31:   %u отсчетов (31 символ BPSK, ~%.3f с)\n", mls31_start_samples, (float)mls31_start_samples/8000.0f);
     total += mls31_start_samples;
     preamble_end_sample = total;
-    printf("              (начало и конец):   %u и %u отсчетов\n", pilot_samples+quiet_start_samples,  pilot_samples+quiet_start_samples+mls31_start_samples);
-    //printf("              Данные:       336000 отсчетов (420 символов, 42.000 с)\n");
-    //
+    printf("              (начало и конец):   %u и %u отсчетов\n", pilot_samples+quiet_start_samples+synchrodummy,  pilot_samples+quiet_start_samples+mls31_start_samples+synchrodummy);
+
+#ifdef GENERATE_DATA
+    const int dummy_symb = 10;
+    printf("              Данные:       %u отсчетов (%u символов)\n", dummy_symb*800, dummy_symb);
+    total += dummy_symb*800;
+#endif
+
     printf("              Пилот-тон:    %d отсчетов (%5.3f с)\n", pilot_samples, pilot_samples/8000.0);
     total += pilot_samples;
     printf("              Конец тишины: %d отсчетов (~%.3f с)\n", quiet_end_samples, (float)quiet_end_samples/8000.0f);
@@ -149,20 +156,10 @@ int main(void) {
         }
     }
 
-    // --- ПОВТОРЕНИЕ ЭТАПА 2: Пилот-тон (Чистая несущая 1000 Гц без модуляции) ---
-    for (int i = 0; i < pilot_samples; i++) {
-        short raw_i, raw_q;
-        dqpsk_synth_tick(&modulator, current_absolute_phase, &raw_i, &raw_q); // остаёмся на той фазе, где остановились при передаче преамбулы
-        clean_sample.re = (float)raw_i / 32000.0f;
-        clean_sample.im = (float)raw_q / 32000.0f;
-
-        channel_sim_process(&channel, &clean_sample, &corrupted_sample);
-        wav_write_sample(&wav_rx, &corrupted_sample);
-    }
-
-#if 0
+#ifdef GENERATE_DATA
     // --- ЭТАП 4: Информационные данные (420 символов) ---
-    for (int sym = 0; sym < 420; sym++) {
+    //for (int sym = 0; sym < 420; sym++) {
+    for (int sym = 0; sym < dummy_symb; sym++) {
         unsigned short phase_shift = dqpsk_get_phase_shift(tx_punctured_5_6[sym * 2], tx_punctured_5_6[sym * 2 + 1]);
         for (int s = 0; s < 800; s++) {
             short raw_i, raw_q;
@@ -176,6 +173,17 @@ int main(void) {
         }
     }
 #endif
+
+    // --- ПОВТОРЕНИЕ ЭТАПА 2: Пилот-тон (Чистая несущая 1000 Гц без модуляции) ---
+    for (int i = 0; i < pilot_samples; i++) {
+        short raw_i, raw_q;
+        dqpsk_synth_tick(&modulator, current_absolute_phase, &raw_i, &raw_q); // остаёмся на той фазе, где остановились при передаче преамбулы
+        clean_sample.re = (float)raw_i / 32000.0f;
+        clean_sample.im = (float)raw_q / 32000.0f;
+
+        channel_sim_process(&channel, &clean_sample, &corrupted_sample);
+        wav_write_sample(&wav_rx, &corrupted_sample);
+    }
 
     // --- ЭТАП 5: Финальная тишина (чистый шум эфира) ---
     clean_sample.re = 0.0f;
@@ -250,72 +258,61 @@ int main(void) {
     mls_init(&mls_sync);
 
 	#define NEEDLE_THRESHOLD 0.50f
-	#define CONST_GROUP_DELAY 50 // Наша расчетная задержка дециматора
+	#define CONST_GROUP_DELAY 261 // Наша задержка дециматора на идеально-чистом сигнале
 
 	static int t_start = 0;
 	static int t_stop = 0;
 
     while (wav_read_sample(&wav_in, &rx_sample) == 1) {
-    	/*
-    	1) check_spectrum_for_pilot
-    	2) coarse_mixer_process
-    	3) fir_filter_process
-    	*/
-    	float needle_val = 0.0f;
-    	float sc_power = 0.0f;
-    	int is_synchronised = mls_tick(&mls_sync, &rx_sample, &needle_val, &sc_power);
-    	fprintf(mls31_csv, "%d, %.4f, %.4f, %.4f\n", b_step, mls_sync.spy, needle_val, cplx_phase(mls_sync.derot)/3.1415);
+        float needle_val = 0.0f;
+        float sc_power = 0.0f;
 
-    	if (mode == SEARCHING_PREAMBLE) {
-    		//float sc_power = 0.0f;
-			//cplx_f32 sc_complex = {0.0f, 0.0f};
+        // Вызываем tick на каждом сэмпле
+		int sync_status = mls_tick(&mls_sync, &rx_sample, &needle_val, &sc_power);
 
-    		//sc_tick(&sc_sync, &rx_sample, &sc_power, &sc_complex);
-
-			// Пишем лог: отсчет, нормированная мощность, вещественная часть узора
-    	    // Функция возвращает 1 строго в момент идеальной тактовой засечки!
+		static float plot_latch = 0.0f;
 
 
-			if (b_step == 8000) { /* тупая симуляция захвата частоты Костасом посреди пилот-тона */
-				mls_sync.is_calibrated = 1;
-				mls_sync.calibre.re = mls_sync.running_sum.re;
-				mls_sync.calibre.im = mls_sync.running_sum.im;
-			};
+        //fprintf(mls31_csv, "%d, %.4f, %.4f, %.4f\n", b_step, sc_power, needle_val, mls_sync.spy);
+        fprintf(mls31_csv, "%d, %.1f, %.4f, %.4f\n", b_step, plot_latch, 100*needle_val, mls_sync.spy);
 
-	        if (needle_val > NEEDLE_THRESHOLD) {
-	            t_start = b_step; // Запомнили точку входа на склон
-	            mode = MEASURING_NEEDLE;
-	        }
-
-			// Пишем лог: b_step, мощность Шмидля-Кокса, и ИГЛА второй ступени
-			//fprintf(mls31_csv, "%d, %.4f, %.4f\n", b_step, sc_power, mls_needle);
-			//fprintf(mls31_csv, "%d, %.4f, %.4f\n", b_step, sc_power, 180.0*cplx_phase(mls_sync.derot)/3.1415);
-
-            //wav_write_sample(&wav_out, &rx_sample);
-    	} else if (mode == MEASURING_NEEDLE) {
-            if (needle_val < NEEDLE_THRESHOLD) {
-                t_stop = b_step; // Запомнили точку выхода со склона
-
-                // Вычисляем геометрический центр купола
-                int center_of_dome = (t_start + t_stop) / 2;
-
-                // Финальная привязка к сетке полезной нагрузки с учетом задержки фильтров
-                int true_viterbi_sync_point = center_of_dome - CONST_GROUP_DELAY;
-
-                printf("[СИНХРОНИЗАЦИЯ] Игла зафиксирована! Истинный конец преамбулы: %d\n", true_viterbi_sync_point);
-                printf("                Конец преамбулы в исходном сигнале (модель): %u\n", preamble_end_sample);
-
-                // Вычисляем точную погрешность относительно ожидаемого значения симулятора
-                int error = true_viterbi_sync_point - preamble_end_sample;
-                printf("[СИНХРОНИЗАЦИЯ] Погрешность системы: %d сэмплов\n", error);
-
-                // Сбрасываем тактовый генератор символов Витерби в 0 и погнали принимать данные!
-                //symbol_sample_counter = 0;
-                mode = GARBLING;
+        if (mode == SEARCHING_PREAMBLE) {
+            // Имитация ручного захвата частоты Костасом посреди пилота
+            if (b_step == 8000) {
+                mls_sync.is_calibrated = 1;
+                mls_sync.calibre.re = mls_sync.running_sum.re;
+                mls_sync.calibre.im = mls_sync.running_sum.im;
             }
-    	} else if (mode == GARBLING)  {
-    		/* just do nothing till end of input file */
-    	} else if (mode == SEARCHING_PILOT) {
+
+            // Ждем жесткий триггер от символьного детектора спада иглы
+            if (sync_status > 0) {
+				plot_latch = 1.0f; // Взводим полку для красивого gnuplot
+
+				int shift_compensation = 0;
+				if (sync_status == 2) {
+					// Победил Канал Б! Делаем поправку: истинный конец преамбулы наступил
+					// на 400 сэмплов позже (или нам нужно прыгнуть в FIFO глубже назад)
+					shift_compensation = -400;
+					printf("[СИНХРОНИЗАЦИЯ] ВНИМАНИЕ: Сработал ортогональный Канал Б!\n");
+				} else {
+					printf("[СИНХРОНИЗАЦИЯ] ВНИМАНИЕ: Сработал Канал А!\n");
+				}
+
+				// Вычисляем прецизионный старт с учетом компенсации канала
+				int true_viterbi_sync_point = b_step + CONST_GROUP_DELAY + shift_compensation;
+
+				printf("[СИНХРОНИЗАЦИЯ] Игла зафиксирована на сэмпле: %d\n", b_step);
+				printf("[СИНХРОНИЗАЦИЯ] Истинный старт полезной нагрузки: %d\n", true_viterbi_sync_point);
+				printf("                Ожидаемый конец преамбулы по модели: %u\n", preamble_end_sample);
+
+				int error = true_viterbi_sync_point - preamble_end_sample;
+				printf("[СИНХРОНИЗАЦИЯ] Итоговая погрешность: %d сэмплов\n", error);
+
+				//mode = GARBLING;
+			}
+        } else if (mode == GARBLING) {
+            // Конвейер демодуляции полезной нагрузки (rx.c) работает здесь
+        } else if (mode == SEARCHING_PILOT) {
 			// Переводим float в честный Q14 (масштаб 16384.0f), чтобы компенсировать внутренний сдвиг БПФ
 	    	fft_incoming_i[sample_idx] = (int16_t)(rx_sample.re * 8192);//16384.0f);
 	    	fft_incoming_q[sample_idx] = (int16_t)(rx_sample.im * 8192);//16384.0f);
