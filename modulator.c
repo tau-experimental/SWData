@@ -1,97 +1,188 @@
 #include "modulator.h"
-#include <math.h>
-#include <string.h>
-#include <stdint.h>
 
-void dqpsk_modulator_init(dqpsk_modulator_t *mod, unsigned int carrier_freq, unsigned int sample_rate) {
+#define SAMPLES_PER_SYMBOL 256  // 31.25 Бод при 8000 Гц
+#define RAMP_SAMPLES       16   // 2 мс на плавное сглаживание углов фазы
+
+// Статическая таблица синуса на 256 точек в FLASH
+const int16_t sin_lut_256[256] = {
+         0,    804,   1608,   2410,   3212,   4011,   4808,   5602,
+      6393,   7179,   7962,   8739,   9512,  10278,  11039,  11793,
+     12539,  13279,  14010,  14732,  15446,  16151,  16846,  17530,
+     18204,  18868,  19519,  20159,  20787,  21403,  22005,  22594,
+     23170,  23731,  24279,  24811,  25329,  25832,  26319,  26790,
+     27245,  27683,  28105,  28510,  28898,  29268,  29621,  29956,
+     30273,  30571,  30852,  31113,  31356,  31580,  31785,  31971,
+     32137,  32285,  32412,  32521,  32609,  32678,  32728,  32757,
+     32767,  32757,  32728,  32678,  32609,  32521,  32412,  32285,
+     32137,  31971,  31785,  31580,  31356,  31113,  30852,  30571,
+     30273,  29956,  29621,  29268,  28898,  28510,  28105,  27683,
+     27245,  26790,  26319,  25832,  25329,  24811,  24279,  23731,
+     23170,  22594,  22005,  21403,  20787,  20159,  19519,  18868,
+     18204,  17530,  16846,  16151,  15446,  14732,  14010,  13279,
+     12539,  11793,  11039,  10278,   9512,   8739,   7962,   7179,
+      6393,   5602,   4808,   4011,   3212,   2410,   1608,    804,
+         0,   -804,  -1608,  -2410,  -3212,  -4011,  -4808,  -5602,
+     -6393,  -7179,  -7962,  -8739,  -9512, -10278, -11039, -11793,
+    -12539, -13279, -14010, -14732, -15446, -16151, -16846, -17530,
+    -18204, -18868, -19519, -20159, -20787, -21403, -22005, -22594,
+    -23170, -23731, -24279, -24811, -25329, -25832, -26319, -26790,
+    -27245, -27683, -28105, -28510, -28898, -29268, -29621, -29956,
+    -30273, -30571, -30852, -31113, -31356, -31580, -31785, -31971,
+    -32137, -32285, -32412, -32521, -32609, -32678, -32728, -32757,
+    -32767, -32757, -32728, -32678, -32609, -32521, -32412, -32285,
+    -32137, -31971, -31785, -31580, -31356, -31113, -30852, -30571,
+    -30273, -29956, -29621, -29268, -28898, -28510, -28105, -27683,
+    -27245, -26790, -26319, -25832, -25329, -24811, -24279, -23731,
+    -23170, -22594, -22005, -21403, -20787, -20159, -19519, -18868,
+    -18204, -17530, -16846, -16151, -15446, -14732, -14010, -13279,
+    -12539, -11793, -11039, -10278,  -9512,  -8739,  -7962,  -7179,
+     -6393,  -5602,  -4808,  -4011,  -3212,  -2410,  -1608,   -804
+};
+
+
+static inline int16_t lut_sin(uint16_t phase) {
+    return sin_lut_256[phase >> 8];
+}
+
+static inline int16_t lut_cos(uint16_t phase) {
+    // Добавление 64 к uint8_t автоматически сделает wrap-around вокруг 255 без всяких условий!
+    uint8_t idx = (phase >> 8) + 64;
+    return sin_lut_256[idx];
+}
+
+void modulator_init(modulator_t *mod, uint32_t carrier_freq, uint32_t sample_rate) {
+    mod->phase_inc = (uint32_t)(((uint64_t)carrier_freq * 65536) / sample_rate);
     mod->phase_acc = 0;
+    mod->state = MOD_STATE_IDLE;
+}
 
-    // Формула шага фазы: (carrier_freq * 65536) / sample_rate
-    // Для 1000 Гц и 8000 Гц: (1000 * 65536) / 8000 = 65536 / 8 = 8192
-    mod->phase_inc = (unsigned short)(((unsigned long long)carrier_freq << 16) / sample_rate);
+void modulator_start_pilot(modulator_t *mod, uint32_t duration_samples) {
+    mod->state = MOD_STATE_PILOT;
+    mod->state_counter = duration_samples;
+    mod->tx_phase_accum = 0;
+}
 
-    int i;
-    FILE *sintab = fopen("sintab.txt", "wt");
-    for (i = 0; i < 256; i++) {
-    	double x = (i * 2.0 * M_PI) / 256.0;
-    	mod->sine_lut[i] = (short)(32000.0 * sin(x));
-    	fprintf (sintab, "%u, %d\n", i, mod->sine_lut[i]);
+void modulator_start_data(modulator_t *mod, const uint8_t *buffer, uint16_t len, mod_state_t mode) {
+    mod->state = mode;
+    mod->tx_buffer = buffer;
+    mod->tx_buffer_len = len;
+    mod->symbol_idx = 0;
+    mod->sample_in_sym = 0;
+    mod->state_counter = 0;
+    mod->tx_phase_accum = 0;
+}
+
+// Внутренний шаг вычисления фазы для нового символа
+static void advance_to_next_symbol(modulator_t *mod) {
+    mod->sample_in_sym = 0;
+    mod->symbol_idx++;
+
+    // Если буфер символов кончился — тушим передатчик
+    if (mod->symbol_idx >= mod->tx_buffer_len) {
+        mod->state = MOD_STATE_IDLE;
+        return;
     }
-    fclose(sintab);
+
+    uint8_t sym_bits = mod->tx_buffer[mod->symbol_idx];
+
+    if (mod->state == MOD_STATE_PREAMBLE) {
+        // Абсолютный BPSK для MLS (0 или 180 градусов)
+        mod->tx_phase_accum = (sym_bits & 1) ? 32768 : 0;
+    }
+    else if (mod->state == MOD_STATE_DATA_DBPSK) {
+        // Дифференциальный BPSK (0 -> фаза на месте, 1 -> инверсия)
+        uint16_t delta = (sym_bits & 1) ? 32768 : 0;
+        mod->tx_phase_accum = (mod->tx_phase_accum + delta) & 0xFFFF;
+    }
+    else if (mod->state == MOD_STATE_DATA_DQPSK) {
+        // Опциональный pi/4-DQPSK (Маппинг Грея на сдвиги фаз)
+        uint16_t delta = 0;
+        switch (sym_bits & 0x03) {
+            case 0x00: delta = 8192;   break; // +45°
+            case 0x01: delta = 24576;  break; // +135°
+            case 0x03: delta = 40960;  break; // -135°
+            case 0x02: delta = 57344;  break; // -45°
+        }
+        mod->tx_phase_accum = (mod->tx_phase_accum + delta) & 0xFFFF;
+    }
 }
 
-// Вызывается внутри прерывания таймера 8 кГц
-void dqpsk_synth_tick(dqpsk_modulator_t *mod, unsigned short symbol_phase, short *out_i, short *out_q) {
-    // 1. Частотный аккумулятор накапливает ТОЛЬКО чистую несущую (FTW)
-    mod->phase_acc = (unsigned short)(mod->phase_acc + mod->phase_inc);
+void modulator_get_next_sample(modulator_t *mod, int16_t *out_i, int16_t *out_q) {
+    if (mod->state == MOD_STATE_IDLE) {
+        *out_i = 0; *out_q = 0;
+        return;
+    }
 
-    // 2. Полная фаза для таблицы синусов — это сумма частотного аккумулятора
-    // и ТЕКУЩЕЙ абсолютной фазы символа
-    unsigned short total_phase = (unsigned short)(mod->phase_acc + symbol_phase);
+    // [Пилот-тон остается без изменений]
+    if (mod->state == MOD_STATE_PILOT) {
+        *out_i = lut_cos(mod->phase_acc);
+        *out_q = lut_sin(mod->phase_acc);
+        mod->phase_acc = (mod->phase_acc + mod->phase_inc) & 0xFFFF;
+        if (mod->state_counter > 0) {
+            mod->state_counter--;
+            if (mod->state_counter == 0) mod->state = MOD_STATE_IDLE;
+        }
+        return;
+    }
 
-    // 3. Извлекаем индексы из полной фазы
-    unsigned char sin_idx = (unsigned char)(total_phase >> 8);
-    unsigned char cos_idx = (unsigned char)((sin_idx + 64) & 0xFF);
+    // --- СИМВОЛЬНЫЕ РЕЖИМЫ (Преамбула / Данные) ---
+    // КРИТИЧЕСКОЕ ИСПРАВЛЕНИЕ: Вычисляем параметры символа ДО тригонометрии
+    if (mod->sample_in_sym == 0) {
+        // Проверяем, не вылетели ли мы за пределы буфера данных
+        if (mod->symbol_idx >= mod->tx_buffer_len) {
+            mod->state = MOD_STATE_IDLE;
+            *out_i = 0; *out_q = 0;
+            return;
+        }
 
-    *out_i = mod->sine_lut[cos_idx];
-    *out_q = mod->sine_lut[sin_idx];
-}
+        uint8_t sym_bits = mod->tx_buffer[mod->symbol_idx];
 
-void dqpsk_modulate_packet_v3(dqpsk_modulator_t *mod, const unsigned char *in_bits, wav_stream_t *wav_out) {
-    // Идем по 420 символам пакета
-    for (int sym = 0; sym < 420; sym++) {
-        // 1. Работает задатчик частоты (раз в символ): кодируем дибит по Грею
-        unsigned short phase_shift = dqpsk_get_phase_shift(in_bits[sym * 2], in_bits[sym * 2 + 1]);
-
-        // 2. Запускаем 800 отсчетов символа (10 Бод)
-        for (int sample_idx = 0; sample_idx < 800; sample_idx++) {
-            short raw_i, raw_q;
-
-            // На самом первом отсчете символа подмешиваем фазовый сдвиг задатчика.
-            // На остальных 799 отсчетах фазовая поправка строго равна 0 (несущая идет непрерывно)
-            unsigned short current_shift = (sample_idx == 0) ? phase_shift : 0;
-
-            // Тикаем боевым DDS-синтезатором
-            dqpsk_synth_tick(mod, current_shift, &raw_i, &raw_q);
-
-            // Конвертируем в формат float для вашего WAV-интерфейса
-            cplx_f32 iq_sample;
-            iq_sample.re = (float)raw_i / 32000.0f;
-            iq_sample.im = (float)raw_q / 32000.0f;
-
-            wav_write_sample(wav_out, &iq_sample);
+        if (mod->state == MOD_STATE_PREAMBLE) {
+            mod->tx_phase_accum = (sym_bits & 1) ? 32768 : 0; // Настоящий BPSK 0/180
+        }
+        else if (mod->state == MOD_STATE_DATA_DBPSK) {
+            uint16_t delta = (sym_bits & 1) ? 32768 : 0;
+            mod->tx_phase_accum = (mod->tx_phase_accum + delta) & 0xFFFF;
+        }
+        else if (mod->state == MOD_STATE_DATA_DQPSK) {
+            uint16_t delta = 0;
+            switch (sym_bits & 0x03) {
+                case 0x00: delta = 8192;   break; // +45°
+                case 0x01: delta = 24576;  break; // +135°
+                case 0x03: delta = 40960;  break; // -135°
+                case 0x02: delta = 57344;  break; // -45°
+            }
+            mod->tx_phase_accum = (mod->tx_phase_accum + delta) & 0xFFFF;
         }
     }
-}
-// Задатчик фазы: принимает дибит, возвращает фазовую поправку для DDS
-unsigned short dqpsk_get_phase_shift(unsigned char b1, unsigned char b2) {
-    if (b1 == 0 && b2 == 0) return 8192;   // +pi/4
-    if (b1 == 0 && b2 == 1) return 24576;  // +3pi/4
-    if (b1 == 1 && b2 == 1) return 40960;  // -3pi/4
-    if (b1 == 1 && b2 == 0) return 57344;  // -pi/4
-    return 0;
-}
 
-void dqpsk_modulate_barker(dqpsk_modulator_t *mod, wav_stream_t *wav_out) {
-    // 6 дибитов, кодирующих 11-битный код Баркера + 1 выравнивающий ноль
-    // Дибиты: 11, 10, 00, 10, 01, 00
-    unsigned char barker_bits[12] = {1,1, 1,0, 0,0, 1,0, 0,1, 0,0};
+    // Берем отсчеты синуса и косинуса на текущей полной фазе
+    uint16_t total_phase = (mod->phase_acc + mod->tx_phase_accum) & 0xFFFF;
+    int16_t raw_i = lut_cos(total_phase);
+    int16_t raw_q = lut_sin(total_phase);
 
-    for (int sym = 0; sym < 6; sym++) {
-        unsigned short phase_shift = dqpsk_get_phase_shift(barker_bits[sym * 2], barker_bits[sym * 2 + 1]);
-
-        for (int sample_idx = 0; sample_idx < 800; sample_idx++) {
-            short raw_i, raw_q;
-            unsigned short current_shift = (sample_idx == 0) ? phase_shift : 0;
-
-            dqpsk_synth_tick(mod, current_shift, &raw_i, &raw_q);
-
-            cplx_f32 iq_sample;
-            iq_sample.re = (float)raw_i / 32000.0f;
-            iq_sample.im = (float)raw_q / 32000.0f;
-            wav_write_sample(wav_out, &iq_sample);
+    // Сглаживание амплитуды (Pulse Shaping)
+    int32_t scale = 32768;
+    if (mod->state != MOD_STATE_PREAMBLE) { // На MLS прямоугольник оставляем нетронутым
+        if (mod->sample_in_sym < RAMP_SAMPLES) {
+            scale = (mod->sample_in_sym * 32768) / RAMP_SAMPLES;
+        } else if (mod->sample_in_sym > (SAMPLES_PER_SYMBOL - RAMP_SAMPLES)) {
+            int samples_from_end = SAMPLES_PER_SYMBOL - mod->sample_in_sym;
+            scale = (samples_from_end * 32768) / RAMP_SAMPLES;
         }
     }
+
+    // Вывод в каналы I и Q
+    *out_i = (int16_t)((raw_i * scale) >> 15);
+    *out_q = (int16_t)((raw_q * scale) >> 15);
+
+    // Логика шага DDS
+    mod->phase_acc = (mod->phase_acc + mod->phase_inc) & 0xFFFF;
+
+    // Переход к следующему отсчету/символу
+    mod->sample_in_sym++;
+    if (mod->sample_in_sym >= SAMPLES_PER_SYMBOL) {
+        mod->sample_in_sym = 0;
+        mod->symbol_idx++; // Инкремент индекса произойдет здесь, а отработает на следующем тике
+    }
 }
-
-

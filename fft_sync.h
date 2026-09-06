@@ -13,8 +13,8 @@
 #define PILOT_MAX_BIN 44 /* 1375 Гц */
 
 // Коэффициенты для квадратичной шкалы: 11.0f ≈ 3.3х в линейной, 7.5f ≈ 2.7х в линейной
-#define PILOT_THRESH_STRICT   11
-#define PILOT_THRESH_RELAXED  7
+#define PILOT_THRESH_STRICT   4 //11
+#define PILOT_THRESH_RELAXED  2 //7
 
 #define COARSE_WIDTH	32
 
@@ -53,7 +53,7 @@ void fft_light_fixed256(const int16_t *in_i, const int16_t *in_q, uint32_t *out_
 void fft_init_tables(void);
 
 float check_spectrum_for_pilot(const float *fft_magnitude);
-float check_mcu_spectrum_for_pilot(const uint32_t *out_sq_magnitude);
+float run_parabolic_detector(const uint32_t *out_sq_magnitude);
 void coarse_mixer_process(coarse_mixer_t *mixer, const cplx_f32 *in_sample, cplx_f32 *out_sample);
 void coarse_mixer_init(coarse_mixer_t *mixer, float freq_error, short *sine_table_ptr);
 

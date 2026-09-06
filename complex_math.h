@@ -1,5 +1,6 @@
 #ifndef COMPLEX_MATH_H
 #define COMPLEX_MATH_H
+#include <stdint.h>
 
 /* Комплексное число с плавающей точкой (для ПК-модели высокой точности) */
 typedef struct {
@@ -40,5 +41,11 @@ float cplx_phase(cplx_f32 in);
 /* Модуль (амплитуда): out = sqrt(re^2 + im^2) */
 /* Использует аппаратный корень на ПК и аппаратный fsqrt.s на CH32V307 */
 float cplx_mag(cplx_f32 in);
+
+typedef struct {
+	int32_t re, im;
+} cplx_i32;
+
+extern /*inline*/ cplx_i32 cplx_i32_mul_conj(cplx_i16 a, cplx_i16 b);
 
 #endif /* COMPLEX_MATH_H */

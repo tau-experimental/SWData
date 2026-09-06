@@ -64,12 +64,6 @@ void conv_encode_pure_1_2(conv_encoder_t *enc, const unsigned char *in_bits, uns
 
         // 4. И только ТЕПЕРЬ сдвигаем историю в регистре кодера для следующего шага
         enc->reg = state7 & 0x3F; // Оставляем только 6 бит памяти
-
-#if 0
-        if ((i >= 719) && (i < 725)) {
-        	printf (">> Шпионский перехват из conv_encode_pure_1_2: i == %u, enc->reg = 0x%02X, g1 = %d, g2 = %d\n", i, enc->reg, g1, g2);
-        }
-#endif
     }
 }
 
@@ -278,7 +272,7 @@ void viterbi_decode_soft_1_2(const unsigned char *in_soft_bits_1_2, unsigned cha
 
     // БЫЛО:
     // Статическая история выживших путей: 840 шагов по 64 байта предков
-    // Занимает 53 760 байт в ОЗУ (или на стеке, если стек позволяет)
+    // Занимает 53 760 байт в ОЗУ (или на стеке, если стек позволяет -- на ПК да, на МК нет!)
     //static unsigned char path_history[840][64];
 
     // СТАЛО:

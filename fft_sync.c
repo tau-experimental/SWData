@@ -170,7 +170,7 @@ static int pilot_detection_counter = 0;
 static int last_stable_bin = -1;
 // Возвращает расстройку в Гц, если пилот найден, или -999.0f, если в эфире только шум
 // Сканирует целочисленный спектр.
-float check_mcu_spectrum_for_pilot(const uint32_t *out_sq_magnitude) {
+float run_parabolic_detector(const uint32_t *spec) {
     int max_bin = -1;
     uint64_t max_sq_amp = 0;
     uint64_t noise_sq_sum = 0;
@@ -178,8 +178,8 @@ float check_mcu_spectrum_for_pilot(const uint32_t *out_sq_magnitude) {
 
     // 1. Ищем максимум во всей разрешенной полосе поиска (с защитой краев)
     for (int bin = PILOT_MIN_BIN; bin <= PILOT_MAX_BIN; bin++) {
-        if (out_sq_magnitude[bin] > max_sq_amp) {
-            max_sq_amp = out_sq_magnitude[bin];
+        if (spec[bin] > max_sq_amp) {
+            max_sq_amp = spec[bin];
             max_bin = bin;
         }
     }
@@ -188,7 +188,7 @@ float check_mcu_spectrum_for_pilot(const uint32_t *out_sq_magnitude) {
     for (int bin = 0; bin < 128; bin++) {
         // Исключаем зону пилота с запасом ±5 бинов от краев поиска для точности
         if (bin < (PILOT_MIN_BIN - 2) || bin > (PILOT_MAX_BIN + 2)) {
-            noise_sq_sum += out_sq_magnitude[bin];
+            noise_sq_sum += spec[bin];
             noise_count++;
         }
     }
@@ -201,10 +201,10 @@ float check_mcu_spectrum_for_pilot(const uint32_t *out_sq_magnitude) {
     uint64_t average_sq_noise = noise_sq_sum / noise_count;
 
     // Минимальный порог абсолютной энергии (для новой шкалы после scale-on-stage)
-    if (max_sq_amp < 500) {
+    /*if (max_sq_amp < 150) {
         pilot_detection_counter = 0;
         return -999.0f;
-    }
+    }*/
 
     // Выбираем порог: если мы уже ведем цель, порог мягче (RELAXED), если только ищем — жестче (STRICT)
     int current_threshold = (pilot_detection_counter > 0) ? PILOT_THRESH_RELAXED : PILOT_THRESH_STRICT;
@@ -222,21 +222,28 @@ float check_mcu_spectrum_for_pilot(const uint32_t *out_sq_magnitude) {
             return -999.0f;
         }
 
-        // Взвешенная интерполяция
-        float Estimated_bin = (float)max_bin;
-        if (max_bin > 0 && max_bin < 127) {
-            uint64_t p_left   = out_sq_magnitude[max_bin - 1];
-            uint64_t p_center = out_sq_magnitude[max_bin];
-            uint64_t p_right  = out_sq_magnitude[max_bin + 1];
-            uint64_t total_p  = p_left + p_center + p_right;
+        // Взвешенная амплитудная параболическая интерполяция (Быстрая, без логарифмов)
+        // Если условия пробития порога выполнены:
+            float Estimated_bin = (float)max_bin;
+            if (max_bin > 0 && max_bin < 127) {
+                // За счет аппаратного sqrtf переходим к линейным амплитудам, убирая квадратичный шум
+                float a_left   = sqrtf((float)spec[max_bin - 1]);
+                float a_center = sqrtf((float)spec[max_bin]);
+                float a_right  = sqrtf((float)spec[max_bin + 1]);
 
-            if (total_p > 0) {
-                Estimated_bin = ((float)(max_bin - 1) * p_left + (float)max_bin * p_center + (float)(max_bin + 1) * p_right) / (float)total_p;
+                float denom = 2.0f * a_center - a_left - a_right;
+                if (denom > 1e-4f) {
+                    float delta = 0.5f * (a_left - a_right) / denom;
+
+                    if (delta > 0.5f)  delta = 0.5f;
+                    if (delta < -0.5f) delta = -0.5f;
+
+                    Estimated_bin = (float)max_bin + delta;
+                }
             }
-        }
 
-        float found_freq = Estimated_bin * BIN_RESOLUTION;
-        return found_freq - 1000.0f;
+            float found_freq = Estimated_bin * BIN_RESOLUTION;
+            return found_freq - 1000.0f; // Возвращаем чистый дрейф частоты относительно пилота
     }
 
     if (pilot_detection_counter > 0) pilot_detection_counter--;

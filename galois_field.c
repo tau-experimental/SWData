@@ -52,6 +52,7 @@ unsigned char gf_mul(unsigned char a, unsigned char b) {
     return gf_exp[gf_log[a] + gf_log[b]];
 }
 
+#if 0
 unsigned char gf_div(unsigned char a, unsigned char b) {
     int diff;
     if (a == 0) return 0;
@@ -62,3 +63,18 @@ unsigned char gf_div(unsigned char a, unsigned char b) {
     diff = gf_log[a] - gf_log[b] + 255;
     return gf_exp[diff];
 }
+#else /* размер таблицы можно уполовинить */
+unsigned char gf_div(unsigned char a, unsigned char b) {
+    if (a == 0) return 0;
+    if (b == 0) return 0; /* Защита от деления на 0 */
+
+    int diff = gf_log[a] - gf_log[b];
+
+    // Коррекция отрицательного индекса
+    if (diff < 0) {
+        diff += 255;
+    }
+
+    return gf_exp[diff];
+}
+#endif
