@@ -14,6 +14,7 @@ C_SRCS += \
 ../conv_llr_encoder.c \
 ../costas_loop.c \
 ../ddc_decimator.c \
+../dds.c \
 ../fft256.c \
 ../fft_sync.c \
 ../galois_field.c \
@@ -26,6 +27,7 @@ C_SRCS += \
 ../reed_solomon.c \
 ../schmidl_cox.c \
 ../scrambler.c \
+../trx.c \
 ../wav_io.c 
 
 C_DEPS += \
@@ -39,6 +41,7 @@ C_DEPS += \
 ./conv_llr_encoder.d \
 ./costas_loop.d \
 ./ddc_decimator.d \
+./dds.d \
 ./fft256.d \
 ./fft_sync.d \
 ./galois_field.d \
@@ -51,6 +54,7 @@ C_DEPS += \
 ./reed_solomon.d \
 ./schmidl_cox.d \
 ./scrambler.d \
+./trx.d \
 ./wav_io.d 
 
 OBJS += \
@@ -64,6 +68,7 @@ OBJS += \
 ./conv_llr_encoder.o \
 ./costas_loop.o \
 ./ddc_decimator.o \
+./dds.o \
 ./fft256.o \
 ./fft_sync.o \
 ./galois_field.o \
@@ -76,6 +81,7 @@ OBJS += \
 ./reed_solomon.o \
 ./schmidl_cox.o \
 ./scrambler.o \
+./trx.o \
 ./wav_io.o 
 
 
@@ -91,7 +97,7 @@ OBJS += \
 clean: clean--2e-
 
 clean--2e-:
-	-$(RM) ./barker_sync.d ./barker_sync.o ./carrier_recovery.d ./carrier_recovery.o ./channel_monitor.d ./channel_monitor.o ./channel_sim.d ./channel_sim.o ./clk_detect.d ./clk_detect.o ./complex_math.d ./complex_math.o ./conv_encoder.d ./conv_encoder.o ./conv_llr_encoder.d ./conv_llr_encoder.o ./costas_loop.d ./costas_loop.o ./ddc_decimator.d ./ddc_decimator.o ./fft256.d ./fft256.o ./fft_sync.d ./fft_sync.o ./galois_field.d ./galois_field.o ./interleaver.d ./interleaver.o ./main.d ./main.o ./mls_sync.d ./mls_sync.o ./modulator.d ./modulator.o ./preamble_detector.d ./preamble_detector.o ./puncturing.d ./puncturing.o ./reed_solomon.d ./reed_solomon.o ./schmidl_cox.d ./schmidl_cox.o ./scrambler.d ./scrambler.o ./wav_io.d ./wav_io.o
+	-$(RM) ./barker_sync.d ./barker_sync.o ./carrier_recovery.d ./carrier_recovery.o ./channel_monitor.d ./channel_monitor.o ./channel_sim.d ./channel_sim.o ./clk_detect.d ./clk_detect.o ./complex_math.d ./complex_math.o ./conv_encoder.d ./conv_encoder.o ./conv_llr_encoder.d ./conv_llr_encoder.o ./costas_loop.d ./costas_loop.o ./ddc_decimator.d ./ddc_decimator.o ./dds.d ./dds.o ./fft256.d ./fft256.o ./fft_sync.d ./fft_sync.o ./galois_field.d ./galois_field.o ./interleaver.d ./interleaver.o ./main.d ./main.o ./mls_sync.d ./mls_sync.o ./modulator.d ./modulator.o ./preamble_detector.d ./preamble_detector.o ./puncturing.d ./puncturing.o ./reed_solomon.d ./reed_solomon.o ./schmidl_cox.d ./schmidl_cox.o ./scrambler.d ./scrambler.o ./trx.d ./trx.o ./wav_io.d ./wav_io.o
 
 .PHONY: clean--2e-
 

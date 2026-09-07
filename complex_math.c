@@ -29,7 +29,7 @@ cplx_f32 cplx_mul(cplx_f32 a, cplx_f32 b) {
     return res;
 }
 
-cplx_f32 cplx_mul_conj(cplx_f32 a, cplx_f32 b) {
+inline cplx_f32 cplx_mul_conj(cplx_f32 a, cplx_f32 b) {
     cplx_f32 res;
     res.re = (a.re * b.re) + (a.im * b.im);
     res.im = (a.im * b.re) - (a.re * b.im);
